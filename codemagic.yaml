@@ -1,0 +1,95 @@
+# Codemagic port of .github/workflows/xnu.yml (plan B vs free-tier macOS runner famine).
+# Free individual plan: 500 Mac mini M2 minutes/month, 120-min build cap — fits ~7 kernel builds.
+# Trigger: manual (Start new build -> xnu-265-sweet) or push to ios26 branch.
+workflows:
+  xnu-265-sweet:
+    name: Heartwood kernel xnu-12377 (26.5, SWEET)
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    environment:
+      vars:
+        MACOS_VERSION: 26.5
+        KERNEL_CONFIG: DEVELOPMENT
+        MACHINE_CONFIG: SWEET
+        DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+        CCACHE_DIR: $CM_BUILD_DIR/.ccache
+        CCACHE_COMPRESS: "1"
+        CCACHE_MAXSIZE: 2G
+        CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime
+        CCACHE_COMPILERCHECK: content
+        # keep going after errors so one run reports every compile failure
+        MAKEFLAGS: -k
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/.ccache
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: ios26
+      cancel_previous_builds: true
+    scripts:
+      - name: Fetch build script + stage patches
+        script: |
+          set -e
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # xnu-12377 series: dxb's patches/26.0 first, ours after them (sweet- prefix)
+          for f in xnu/patches-12377/*.patch xnu/patches-12377/*.sh; do
+            [ -e "$f" ] || continue
+            cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
+          done
+          ls dxb/patches/26.0
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # dxb only warns when a patch does not apply; for ours that would silently
+          # produce a kernel without it — make it fatal.
+          python3 - <<'PY'
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          needle = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"\n'
+          assert needle in s, 'build.sh patches() layout changed; update the fatal-patch hook'
+          s = s.replace(needle, needle + '                case "$(basename "${PATCH}")" in [0-9]*|sweet-*) error "our patch does not apply: ${PATCH}"; exit 1 ;; esac\n')
+          open(p, 'w').write(s)
+          PY
+      - name: Deps + Xcode selection
+        script: |
+          set -e
+          brew install jq gum bash cmake ninja ccache
+          # build.sh only checks that xcodes exists (Xcode is preinstalled)
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_26.1*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$CM_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+          ccache --version | head -1
+          ccache -z >/dev/null
+      - name: Build
+        working_directory: dxb
+        script: |
+          set +e
+          bash build.sh > build.log 2>&1
+          rc=$?
+          grep -aE "error:|our patch does not apply|Staged|Applying patch|Skipping patch" build.log | grep -v "warning" | head -300
+          tail -40 build.log
+          exit $rc
+      - name: Collect kernel + logs
+        working_directory: dxb
+        script: |
+          set +e
+          mkdir -p "$CM_BUILD_DIR/out"
+          cp -R fakeroot/System/Library/Kernels/. "$CM_BUILD_DIR/out/" 2>/dev/null || true
+          (cd "$CM_BUILD_DIR/out" && shasum -a 256 kernel.* > SHA256SUMS) || true
+          gzip -c build.log > "$CM_BUILD_DIR/out/build.log.gz" || true
+          ls -la "$CM_BUILD_DIR/out"
+          exit 0
+    artifacts:
+      - out/**
