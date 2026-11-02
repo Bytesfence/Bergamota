@@ -624,7 +624,10 @@ def live(a):
         write_tar(st, buf)
         buf.seek(0)
         with tarfile.open(fileobj=buf, mode='r:') as tf:
-            tf.extractall(d, filter='fully_trusted')
+            try:
+                tf.extractall(d, filter='fully_trusted')
+            except TypeError:  # py<3.11.4 has no filter kwarg; its default == fully_trusted
+                tf.extractall(d)
         log(f'DRY RUN: unpacked the install tar into {d}; no connection to the phone was made. Remote steps:')
         for c in cmds:
             print('   ssh phone:', c)
@@ -729,7 +732,10 @@ def image_stage(root, owners_out):
     write_tar(st, buf, image=True)
     buf.seek(0)
     with tarfile.open(fileobj=buf, mode='r:') as tf:
-        tf.extractall(root, filter='fully_trusted')    # owners are not applied (no root): the map below does it
+        try:
+            tf.extractall(root, filter='fully_trusted')    # owners are not applied (no root): the map below does it
+        except TypeError:  # py<3.11.4 has no filter kwarg; its default == fully_trusted
+            tf.extractall(root)
     if not os.path.islink(var) or os.readlink(var) != target:
         die('/var is no longer the symlink it was: aborting')
     if not os.path.isdir(os.path.join(root, 'private/var/jb')):
