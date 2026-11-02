@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-11-02: first real Linux host validated (user's Debian 12 box, romyscowitz) <<<
+* Host: Debian 12 (bookworm), 4 cores / 11 GB RAM; root fs has only ~11 GB free (a 500 GB USB 3.0 drive is pending for the workspace). Clone at `~/ios-beryllium`, develop 37a7a7a, submodule gpu/metal at Chlorophyll d3cb665.
+* The Linux Renegade path had never run on a real Linux machine. `renegade test`: 54 tests, 47 pass / 7 errors — ALL 7 in test_package.py, stale vs package.py's new `--ssh` step (author's machine has `research/ssh-build/out`; a generic host doesn't). Fixed by giving the tests their own ssh fixture like sweetnet/bgl, plus the missed `collect` 3-arg site and the zip-names expectation: after that **54/54 OK on Linux, 1 skip (t_parity, macOS only). Commit d6fe4ec on develop (local, not pushed; no fork yet).
+* Platform tests (test_platform.py) clean on Linux. Next concrete: apt deps (`python3 curl hfsprogs util-linux zstd dropbear-bin cmake g++ git libfuse3-dev libbz2-dev zlib1g-dev libattr1-dev fuse3`), build apfs-fuse, install blacktop/ipsw .deb, move the clone onto the USB drive when it lands, then `renegade fetch` + `RENEGADE_DRY_RUN=1 renegade root` as the first full Linux rehearsal. Kernel builds still need the user's new GitHub fork (account being made). phone: battery replacement arrives today; beryllium currently runs Windows 10 ARM (bootloader unlocked, tianma panel) - WMA install on userdata is disposable per user.
+
 ### >>> 2026-10-26: Wi-Fi, PAC fallback and Chlorophyll-on-Turnip merged into develop (user) <<<
 * Wi-Fi `claude/wlan26-chip-037a03` was already develop (f4b36c1, boot 54 WPA2 join). Merged `claude/peaceful-saha-28595a` (xnu-12377 1019 PAC emulation, tools/pacemu) and `claude/chlorophyll-turnip-c432e2` (freedreno-sweet syncobjs + prime fds, sweetgpu, notes; NOTES conflict: both sections kept below).
 * Chlorophyll: `ios26` fast-forwarded to `turnip` d3cb665 (Turnip runtime, Mesa 26.2.5, guard-page slack); `gpu/metal` gitlink dbfcd6d -> d3cb665. The Turnip session's boot 54-55 notes (SpringBoard SMMU faults, guard-page fix) are not yet in NOTES on this branch. Nothing pushed (develop and Chlorophyll ios26 are local).
