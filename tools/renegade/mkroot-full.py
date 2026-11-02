@@ -56,7 +56,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, text=True, **kw)
 
 
-def free_bytes(path=ROOT):
+def free_bytes(path=W):   # work dir (image + sources) — NOT the repo: split layouts keep artifacts off the repo disk
     st = os.statvfs(path)
     return st.f_bavail * st.f_frsize
 
