@@ -64,8 +64,11 @@ workflows:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_26.1*.app 2>/dev/null | sort -V | tail -1)
-          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app | sort -V | head -1)
+          # GitHub runners name bundles Xcode_26.6.app (underscore); Codemagic uses Xcode-26.6.app
+          # (hyphen) plus an unversioned Xcode.app default. Handle all three.
+          XC=$(ls -d /Applications/Xcode_26.1*.app /Applications/Xcode-26.1*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app /Applications/Xcode-26.*.app 2>/dev/null | sort -V | head -1)
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$CM_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
