@@ -36,14 +36,15 @@ class TestPackage(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.sn, self.gl = os.path.join(self.tmp, 'sweetnet'), os.path.join(self.tmp, 'a', 'b', 'bgl')
-        for base, items in ((self.sn, pk.SWEETNET), (self.gl, pk.BGL)):
+        self.ssh = os.path.join(self.tmp, 'ssh-build', 'out')
+        for base, items in ((self.sn, pk.SWEETNET), (self.gl, pk.BGL), (self.ssh, pk.SSH)):
             for rel, kind in items:
                 p = os.path.join(base, *rel.split('/'))
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, 'wb') as f:
                     f.write(macho() if kind == 'macho' else b'<plist/>\n')
                 os.chmod(p, 0o755 if kind == 'macho' else 0o644)
-        self.args = argparse.Namespace(version='3', out=os.path.join(self.tmp, 'out'), sweetnet=self.sn, bgl=self.gl, bgl_commit='b' * 40)
+        self.args = argparse.Namespace(version='3', out=os.path.join(self.tmp, 'out'), sweetnet=self.sn, bgl=self.gl, bgl_commit='b' * 40, ssh=self.ssh)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -65,7 +66,8 @@ class TestPackage(unittest.TestCase):
         with zipfile.ZipFile(z) as zf:
             names = sorted(zf.namelist())
         self.assertEqual(names, sorted([bt.MANIFEST] + ['sweetnet/' + r for r, _ in pk.SWEETNET] +
-                                       ['bergamota-gl/' + r for r, _ in pk.BGL] + ['LICENSES/' + l for l in pk.LICENSES]))
+                                       ['bergamota-gl/' + r for r, _ in pk.BGL] + ['ssh/' + r for r, _ in pk.SSH] +
+                                       ['LICENSES/' + l for l in pk.LICENSES]))
         cache = os.path.join(self.tmp, 'cache')
         d = bt.install_zip(z, cache, digest, log=lambda *_: None)
         self.assertTrue(os.access(os.path.join(d, 'sweetnet', 'sweetreboot'), os.X_OK))
@@ -117,7 +119,7 @@ class TestPackage(unittest.TestCase):
             for i in src.infolist():
                 dst.writestr(i, src.read(i.filename) + (b'!' if i.filename == 'sweetnet/sweetreboot' else b''))
         with self.assertRaises(bt.ToolsError):
-            pk.verify(bad, pk.collect(self.sn, self.gl))
+            pk.verify(bad, pk.collect(self.sn, self.gl, self.ssh))
 
 
 if __name__ == '__main__':
