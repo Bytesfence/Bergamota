@@ -122,7 +122,7 @@ def die(msg):
 
 
 def mac_free():
-    st = os.statvfs(ROOT)
+    st = os.statvfs(CACHE)  # guard the work-dir fs: research/ may be a symlink onto another disk
     return st.f_bavail * st.f_frsize
 
 
