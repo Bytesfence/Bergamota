@@ -107,8 +107,8 @@ cp -f "$WORK/mesa-turnip26/setup-ios.log" "$DEST/" 2>/dev/null || true
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 if [ -d "$SDK/usr/include" ]; then
   HDR="$DEST/sdk-headers"
-  rm -rf "$HDR"; mkdir -p "$HDR/System/Library/Frameworks"
-  cp -R "$SDK/usr/include" "$HDR/usr/include"
+  rm -rf "$HDR"; mkdir -p "$HDR/System/Library/Frameworks" "$HDR/usr"
+  cp -R "$SDK/usr/include" "$HDR/usr/"
   for fw in Foundation CoreFoundation Metal MetalKit IOSurface QuartzCore CoreGraphics ObjectiveC; do
     [ -d "$SDK/System/Library/Frameworks/$fw.framework/Headers" ] && \
       cp -R "$SDK/System/Library/Frameworks/$fw.framework/Headers" "$HDR/System/Library/Frameworks/$fw.framework/Headers"
