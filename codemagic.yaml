@@ -156,8 +156,10 @@ workflows:
           rm -rf "$HDR"; mkdir -p "$HDR/System/Library/Frameworks" "$HDR/usr" "$DEST"
           cp -R "$SDK/usr/include" "$HDR/usr/"
           for fw in Foundation CoreFoundation Metal MetalKit IOSurface QuartzCore CoreGraphics ObjectiveC; do
-            [ -d "$SDK/System/Library/Frameworks/$fw.framework/Headers" ] && \
+            if [ -d "$SDK/System/Library/Frameworks/$fw.framework/Headers" ]; then
+              mkdir -p "$HDR/System/Library/Frameworks/$fw.framework"
               cp -R "$SDK/System/Library/Frameworks/$fw.framework/Headers" "$HDR/System/Library/Frameworks/$fw.framework/Headers"
+            fi
           done
           tar -C "$DEST" -czf "$DEST/sdk-headers.tar.gz" sdk-headers
           rm -rf "$HDR"
