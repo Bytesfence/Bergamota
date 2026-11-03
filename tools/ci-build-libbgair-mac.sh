@@ -8,9 +8,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BG_GPU="$ROOT/gpu"
 METAL="$BG_GPU/metal"
 WORK="$HOME/mesa-air"
-VENV="${GPU_EAGL_VENV:-$HOME/venv}"
+VENV="${GPU_EAGL_VENV:-$HOME/bgvenv}"
+MESON="$VENV/bin/meson"
 OUT="$ROOT/out-mac"
 mkdir -p "$WORK" "$OUT" "$WORK/pc-ios" "$WORK/drm-ios-link"
+
+# hard gate: meson must run under a python that has mako
+"$VENV/bin/python3" -c "import mako, yaml; print('mako gate ok', __import__('sys').version)" || { echo "FATAL: mako not importable in $VENV"; exit 1; }
 
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 echo "== SDK: $SDK"
@@ -95,7 +99,7 @@ EOP
 cd "$D"
 export PATH="$(brew --prefix bison)/bin:$VENV/bin:$PATH"
 if [ ! -d build-ios ]; then
-  meson setup build-ios mesa --cross-file ios-hw.cross --buildtype=release \
+  "$MESON" setup build-ios mesa --cross-file ios-hw.cross --buildtype=release \
     -Dgallium-drivers=softpipe,freedreno -Dfreedreno-kmds=msm \
     -Dgallium-xa=disabled -Dtools= -Dvulkan-drivers= -Dllvm=disabled -Dglx=disabled \
     -Degl=disabled -Dgbm=disabled -Dplatforms= \

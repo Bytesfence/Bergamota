@@ -110,8 +110,10 @@ workflows:
         script: |
           set -e
           brew install -q bison ninja pkg-config
-          python3 -m venv "$HOME/venv"
-          "$HOME/venv/bin/pip" install -q mako pyyaml meson
+          rm -rf "$HOME/bgvenv"
+          python3 -m venv "$HOME/bgvenv"
+          "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson
+          "$HOME/bgvenv/bin/python3" -c "import mako, yaml; print('bgvenv mako ok')"
       - name: submodules (chlorophyll + mesa + libdrm)
         script: |
           set -e
@@ -122,7 +124,8 @@ workflows:
       - name: build libbgair.dylib
         script: |
           set -e
-          export GPU_EAGL_VENV="$HOME/venv"
+          export GPU_EAGL_VENV="$HOME/bgvenv"
+          "$HOME/bgvenv/bin/python3" -c "import mako, yaml; print('build-step mako ok')"
           bash tools/ci-build-libbgair-mac.sh
     artifacts:
       - out-mac/*.dylib
