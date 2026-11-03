@@ -109,7 +109,7 @@ if [ -d "$SDK/usr/include" ]; then
   HDR="$DEST/sdk-headers"
   rm -rf "$HDR"; mkdir -p "$HDR/System/Library/Frameworks" "$HDR/usr"
   cp -R "$SDK/usr/include" "$HDR/usr/"
-  for fw in Foundation CoreFoundation Metal MetalKit IOSurface QuartzCore CoreGraphics ObjectiveC; do
+  for fw in Foundation CoreFoundation Metal MetalKit IOSurface QuartzCore CoreGraphics ObjectiveC Security CFNetwork CoreServices CoreText ImageIO UniformTypeIdentifiers; do
     if [ -d "$SDK/System/Library/Frameworks/$fw.framework/Headers" ]; then
       mkdir -p "$HDR/System/Library/Frameworks/$fw.framework"
       cp -R "$SDK/System/Library/Frameworks/$fw.framework/Headers" "$HDR/System/Library/Frameworks/$fw.framework/Headers"

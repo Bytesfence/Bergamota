@@ -28,8 +28,12 @@ command -v ld64.lld-14 >/dev/null || command -v ld64.lld >/dev/null || { echo "F
 LD="$(command -v ld64.lld-14 || command -v ld64.lld)"
 mkdir -p "$OUT"
 
-# mirrors build-metal.sh's flags for the inject (arm64e, iOS 18, non-ARC)
+# mirrors build-metal.sh's flags for the inject (arm64e, iOS 18, non-ARC).
+# TARGET_OS_*: the iOS 26 SDK's TargetConditionals.h only feeds Apple clang's __is_target_* builtins
+# (and its static fallback wants __APPLE_CPP__/__MACOS_CLASSIC__), so vanilla clang gets no target
+# macros at all — Foundation then skips <objc/NSObjCRuntime.h> and NSInteger disappears.
 CFLAGS="-target arm64e-apple-ios18.0 -isysroot $SDKROOT -I$ROOT/gpu/metal/air \
+  -DTARGET_OS_MAC=1 -DTARGET_OS_IPHONE=1 -DTARGET_OS_IOS=1 \
   -O1 -fno-objc-arc -fno-modules -Wall -Wno-deprecated-declarations -Wno-unguarded-availability-new \
   -Wno-availability"
 
