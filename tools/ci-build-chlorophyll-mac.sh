@@ -60,7 +60,7 @@ fi
 # is cloned pristine from upstream, so neutralize the line here and keep the same Homebrew
 # SPIRV-Tools guard via the PKG_CONFIG_LIBDIR env var (exported below).
 sed -i '' "/^pkg_config_libdir = /d" "$ROOT/gpu/metal/turnip/build-turnip.sh"
-grep -q "pkg_config_libdir" "$ROOT/gpu/metal/turnip/build-turnip.sh" && { echo "FATAL: sed did not remove pkg_config_libdir"; exit 1; }
+grep -q "^pkg_config_libdir = " "$ROOT/gpu/metal/turnip/build-turnip.sh" && { echo "FATAL: sed did not remove pkg_config_libdir"; exit 1; }
 echo "build-turnip.sh patched for meson >=1.11 (pkg_config_libdir line removed)"
 
 export PKG_CONFIG_LIBDIR="$TURNIP_D/pc-ios"   # the guard build-turnip.sh's cross file used to carry
