@@ -27,7 +27,9 @@ if [ ! -f "$WORK/libz-ios/libz.a" ]; then
   curl -sL https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz | tar xz -C "$WORK"
   ( cd "$WORK/zlib-1.3.1"
     for f in *.c; do
-      xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=18.0 -isysroot "$SDK" -O2 -w -c "$f" -o "${f%.c}.o"
+      # -include unistd.h: zlib's gzlib.c uses lseek without including it on the
+      # Apple chain; clang >= 18 makes implicit declarations a hard error.
+      xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=18.0 -isysroot "$SDK" -O2 -w -include unistd.h -c "$f" -o "${f%.c}.o"
     done
     libtool -static -o "$WORK/libz-ios/libz.a" *.o )
 fi
