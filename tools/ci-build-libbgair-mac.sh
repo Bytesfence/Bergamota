@@ -91,11 +91,15 @@ pkg-config = 'pkg-config'
 [properties]
 pkg_config_path = ['$WORK/pc-ios']
 c_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK', '-Wno-unused-command-line-argument']
-c_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK', '-undefined', 'dynamic_lookup']
+# NOTE: no -undefined dynamic_lookup here! With it, every meson has_function
+# probe "links" and Mesa gets configured with Linux-isms (memfd_create,
+# secure_getenv, posix_fallocate...) that would crash at runtime on iOS.
+# Probes must resolve against the real SDK stubs so the feature set is truthful.
+c_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK']
 cpp_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK', '-Wno-unused-command-line-argument', '-fno-rtti', '-fno-exceptions']
-cpp_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK', '-undefined', 'dynamic_lookup']
+cpp_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK']
 objc_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK']
-objc_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK', '-undefined', 'dynamic_lookup']
+objc_link_args = ['-arch', 'arm64e', '-miphoneos-version-min=18.0', '-isysroot', '$SDK']
 [host_machine]
 system = 'darwin'
 subsystem = 'ios'
