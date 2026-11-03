@@ -116,8 +116,12 @@ workflows:
           python3 -m venv "$HOME/bgvenv"
           # packaging: mesa's mako/yaml version checks import it; distutils fallback
           # is gone in Python 3.12, so without it the check fails as "no mako".
-          "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson packaging
+          # ninja: the runner image has no ninja; build-turnip.sh puts $VENV/bin on
+          # PATH before meson setup, and meson aborts at the END of configure
+          # ("Could not detect Ninja v1.8.2") if it is missing.
+          "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson packaging ninja
           "$HOME/bgvenv/bin/python3" -c "import mako, yaml, packaging; print('bgvenv ok')"
+          "$HOME/bgvenv/bin/ninja" --version
       - name: submodules (chlorophyll + libdrm)
         script: |
           set -e

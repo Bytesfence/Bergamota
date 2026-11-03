@@ -27,6 +27,8 @@ assert Version(mako.__version__) >= Version("0.8.0")
 print("mako gate ok:", mako.__version__)
 GATE
 command -v glslangValidator >/dev/null || { echo "FATAL: glslangValidator missing (brew install glslang)"; exit 1; }
+"$VENV/bin/ninja" --version >/dev/null 2>&1 || { echo "FATAL: $VENV/bin/ninja missing (pip install ninja into the venv)"; exit 1; }
+echo "ninja ok: $("$VENV/bin/ninja" --version) at $VENV/bin/ninja (build-turnip.sh puts it on PATH)"
 
 # --- pre-create the mesa-turnip26 tree ourselves.
 # build-turnip.sh's `git clone --shared` from the tag-only shallow source yields an EMPTY
