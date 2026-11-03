@@ -55,6 +55,15 @@ if [ ! -f "$TURNIP_D/mesa/src/compiler/air/air_to_nir.c" ]; then
   echo "mesa tree prepped: $(git -C "$TURNIP_D/mesa" rev-parse --short HEAD) + 6 patches + air/ symlinked"
 fi
 
+# meson >=1.11 (pip-latest on CI) rejects `pkg_config_libdir` as a cross-file option, which
+# kills build-turnip.sh's meson setup SILENTLY (its error goes to setup-ios.log). The submodule
+# is cloned pristine from upstream, so neutralize the line here and keep the same Homebrew
+# SPIRV-Tools guard via the PKG_CONFIG_LIBDIR env var (exported below).
+sed -i '' "/^pkg_config_libdir = /d" "$ROOT/gpu/metal/turnip/build-turnip.sh"
+grep -q "pkg_config_libdir" "$ROOT/gpu/metal/turnip/build-turnip.sh" && { echo "FATAL: sed did not remove pkg_config_libdir"; exit 1; }
+echo "build-turnip.sh patched for meson >=1.11 (pkg_config_libdir line removed)"
+
+export PKG_CONFIG_LIBDIR="$TURNIP_D/pc-ios"   # the guard build-turnip.sh's cross file used to carry
 bash "$ROOT/gpu/metal/turnip/build-turnip.sh" || {
   echo "== build-turnip.sh FAILED =="
   echo "== setup-ios.log tail:"; tail -80 "$TURNIP_D/setup-ios.log" 2>/dev/null
