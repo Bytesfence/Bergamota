@@ -890,3 +890,21 @@ Chronology of the phone round (all gates, no luck):
 - FIX (gpu/metal submodule, branch completion-queue on Bytesfence/Chlorophyll, parent develop fb6ee54): BGMTLCommandQueue stores/retains the queue (dealloc releases), completed+scheduled handlers dispatch_sync onto it when set, MTLCommandQueueSPI conformance declared in +load, device answers setResponsibleProcess:/setGPUPriority: as real no-ops. dispatch_sync chosen over async for handler lifetime simplicity under manual RR; handlers observe dispatch_get_current() == Metal's queue either way.
 - Next: manual CodeMagic run "chlorophyll (iOS turnip stack)" on develop (~35 min), then /tmp/opencode/deploy-inject.sh <out-metal> (ladder + submit-counter verdict). Phone stable meanwhile.
 - Learned today: BSD ps -A needs `read -r pid` (leading spaces break cut); TWRP toybox dd has no conv=; HFSX v5 catalog = 8 extent descriptors (16 u32) per fork, recordType 2 = file; ry NOTES mention kernel boot-arg sweetdenypath= as an inject kill switch (kernel 1016+).
+
+## 2026-11-04 ~00:00 — art10: GPU renders, CA falls back on missing PRESENT path
+- art9 (local-build era begins, ~1 min/iteration on the Debian host: clang-14 + ld64.lld + tbd stubs + theos/sdks headers + TARGET_OS_* macros; see tools/local-build-inject.sh):
+  pipeline-compile retry + per-process off-switches ended the crash storms. Engaged boot: stable, healthy, zero churn.
+- art10 telemetry (commit/complete/present per buffer) decoded the 3 fps fallback:
+  * every engagement renders ~8 REAL frames first (kernel submits with 4096/5978-dword IBs),
+  * then CA commits hollow buffers (scheduled 0, presents 0) at ~3.6/s = the 3 fps software loop,
+  * presents 0 on EVERY buffer incl. the real ones — presentDrawable is never called / never reaches us:
+    GPU frames never reach the panel, CA's display pipeline sees dead output, falls back permanently.
+- Crash forensics that got here: ips "termination COREANIMATION: Turnip would not compile the render
+  pipeline VfxU10Xh + Tc3sA2Xhf_IsrcM1 (VkResult -2)" = vkCreateGraphicsPipelines OUT_OF_DEVICE_MEMORY,
+  transient at cold boot (contention), solved by retry 5x800ms + de-contention (posters stock via
+  /private/var/tmp/bgmtl.off.<bundleid>). The art6/7/8 "Foundation/BaseBoard abort" was this same CA kill.
+- NEXT BATTLE: the present/display path. Ideas: run test/bgmtl_layer_probe + bgmtl_carenderer_probe on-device
+  (build locally too), find which present API CA26 actually uses (no UNIMPLEMENTED logged for any present
+  selector — suspicious; maybe the render server delivers frames via IOSurface scanout, not command-buffer
+  presents). Author saw "GPU frames with artifacts" once — the path exists somehow.
+- Phone state: engaged art10, software 3 fps, stable; poster off-switches present. Inject art10 md5 c6e36a6d.
