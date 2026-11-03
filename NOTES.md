@@ -935,3 +935,33 @@ Chronology of the phone round (all gates, no luck):
 - Meters that work: [pid] perf:/frames: lines in bgmtl.log (perf file /private/var/tmp/bgmtl.perf), fb
   stats line in kernel console (swaps_s/copy_s/zc_frames), CPU-time deltas during timed swipes
   (software = 300%+ SpringBoard / GPU = ~60% backboardd encode-bound).
+
+## 2026-11-04 ~01:30-02:00 — 60 fps pipeline proven; visible-GPU confirmed; stability is the last battle
+- **Boot args were the missing present path.** Stock image booted `mode=copy, zc_frames=0` (every frame
+  CPU-copied; zero-copy never requested). Byte-patched the boot-args field (437/607 B) appending
+  `sweetfb_direct=1 sweetfb_scancopy=1 sweetfb_swapdepth=2 sweetgpuboost=7`. Kernel already had the code.
+  Image: enxerto-boot-scancopy.img (also at /mnt/bergamota/research/ios26/).
+- **Pipeline measured at 60 fps**: `frames: 60.4/60.0/60.1 fps while animating`, zero slow intervals;
+  42.5 fps with 50 draws/cbuf under real swiping; fb 52.9 swaps/s; panel runs hz=59 in this mode.
+  Warm engage (kill + respawn into settled system) is mandatory: engaged-at-boot = 10 fps, warm = 30-60.
+- **GPU visibly renders the UI** — user A/B: with backboardd switched to stock, GPU-era artifacts and
+  blinking spots DISAPPEARED (artifacts are the GPU path's fingerprints). BUT under sustained swiping the
+  GPU path melts down: missing icons, home-screen collapse. Matches the author's "dirty regions and
+  async commits still break drawing (A/B 2026-10-24)" verbatim.
+- **Suspect #1 for next session: art8's ASYNC completed handlers.** The author's line points at async
+  commits + dirty regions; our art8 made completion dispatch async. Experiment: revert completed to SYNC
+  (art5 dispatch), re-test artifacts/meltdown. Also: kernel SMMU programming for MDP streams 0x880/0xc80
+  (identity CB like GPU's 0x740) to pass the probe, arm scancopy, drop the ~6.5 ms/frame CPU copy.
+- **GPU fault under load**: SMMU CB1 FAULT FAR 0xda0ea080, recovery voids in-flight submissions →
+  "3 failed command buffers" circuit breaker (bgmtl-bb.off) → stock fallback. Once in ~5 min of use.
+- **Injection map**: backboardd + poster appex = re-signed binaries with LC_LOAD_DYLIB (author's addlc.py,
+  needs ~64 B slack). iconservicesagent: 80 B slack, wired + deployed + reverted for stability (orig in
+  /var/root, re-deploy any time). SpringBoard: 16 B slack — LC impossible; plist DYLD_INSERT works
+  mechanically but platform-binary launch unnests the DYLD shared region per spawn → respring freeze;
+  REVERTED (orig in /var/root). SpringBoard needs a new injection trick (hook a framework it loads?).
+- **Posters re-enabled** (all off-switches removed 2026-11-04): spawn on lock/unlock; Mercury renders the
+  wallpaper through Chlorophyll (wired since the author's era). Phone left STABLE: stock backboardd,
+  bgmtl-bb.off present.
+- Meters that work: bgmtl.log [pid] perf:/frames: (needs /private/var/tmp/bgmtl.perf), fb stats line
+  (swaps_s/copy_s/zc_frames/pool), CPU-time deltas during timed swipes (GPU ~60% bb encode-bound vs
+  software 300%+ SpringBoard), A/B eye tests. Console submit lines = first 8 per boot only — do not use.
