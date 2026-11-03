@@ -28,7 +28,39 @@ print("mako gate ok:", mako.__version__)
 GATE
 command -v glslangValidator >/dev/null || { echo "FATAL: glslangValidator missing (brew install glslang)"; exit 1; }
 
-bash "$ROOT/gpu/metal/turnip/build-turnip.sh"
+# --- pre-create the mesa-turnip26 tree ourselves.
+# build-turnip.sh's `git clone --shared` from the tag-only shallow source yields an EMPTY
+# repo on some git versions (reproduced locally: no refs/heads in a --branch <tag> clone,
+# so the shared clone has nothing to check out and every patch fails with "No such file").
+# We clone directly from gitlab and PIN the tag's commit; build-turnip.sh then skips its
+# own tree-prep block entirely ([ ! -d mesa ]).
+TURNIP_D="$WORK/mesa-turnip26"
+MESA_SRC="$WORK/mesa-src-26.2.5"
+MESA_URL=https://gitlab.freedesktop.org/mesa/mesa.git
+# mesa-26.2.5^{tag} (verified 2026-11-03 via ls-remote; all 6 mesa-26.2 patches apply cleanly)
+MESA_TAG_COMMIT=ddaf85e353442d9d7f192fdcf1823e652e3f2ee3
+if [ ! -f "$MESA_SRC/meson.build" ]; then
+  git clone -q --depth 1 --branch mesa-26.2.5 "$MESA_URL" "$MESA_SRC"
+fi
+if [ ! -f "$TURNIP_D/mesa/src/compiler/air/air_to_nir.c" ]; then
+  rm -rf "$TURNIP_D/mesa"
+  git clone -q --depth 1 --branch mesa-26.2.5 "$MESA_URL" "$TURNIP_D/mesa"
+  [ "$(git -C "$TURNIP_D/mesa" rev-parse HEAD)" = "$MESA_TAG_COMMIT" ] || { echo "FATAL: mesa-26.2.5 tag moved (expected $MESA_TAG_COMMIT)"; exit 1; }
+  for p in air-frontend ir3-round-default ir3-ssbo-subdword ir3-context-error-return ir3-disk-cache-macho turnip-ios; do
+    git -C "$TURNIP_D/mesa" apply "$ROOT/gpu/metal/patches/mesa-26.2/$p.patch" || { echo "FATAL: mesa-26.2 patch $p does not apply"; exit 1; }
+    echo "mesa patched: $p"
+  done
+  mkdir -p "$TURNIP_D/mesa/src/compiler/air"
+  for f in "$ROOT"/gpu/metal/air/*; do ln -sf "$f" "$TURNIP_D/mesa/src/compiler/air/$(basename "$f")"; done
+  echo "mesa tree prepped: $(git -C "$TURNIP_D/mesa" rev-parse --short HEAD) + 6 patches + air/ symlinked"
+fi
+
+bash "$ROOT/gpu/metal/turnip/build-turnip.sh" || {
+  echo "== build-turnip.sh FAILED =="
+  echo "== setup-ios.log tail:"; tail -80 "$TURNIP_D/setup-ios.log" 2>/dev/null
+  echo "== meson-log.txt tail:"; tail -120 "$TURNIP_D/build-ios/meson-logs/meson-log.txt" 2>/dev/null
+  exit 1
+}
 
 if ! bash "$ROOT/gpu/metal/turnip/build-metal.sh"; then
   echo "!! build-metal.sh failed (likely a probe/tool build); building just the inject dylib as fallback"
