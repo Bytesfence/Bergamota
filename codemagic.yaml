@@ -97,10 +97,12 @@ workflows:
     artifacts:
       - out/**
 
-  # libbgair.dylib (GPU translator) for iOS: real iphoneos SDK, pacstrip --sign.
-  # Manual trigger only (Start new build -> libbgair (iOS)); does not touch the kernel flow.
-  libbgair-ios:
-    name: libbgair (iOS)
+  # Chlorophyll/Turnip GPU stack for iOS: the author's FINAL phone stack (replaces the abandoned
+  # libbgair path). Author scripts unmodified: turnip/build-turnip.sh (Mesa 26.2.5 from gitlab)
+  # + turnip/build-metal.sh (bgmtl-inject.dylib, drop-in for the deployed backboardd).
+  # Manual trigger only (Start new build -> chlorophyll (iOS)); does not touch the kernel flow.
+  chlorophyll-ios:
+    name: chlorophyll (iOS turnip stack)
     instance_type: mac_mini_m2
     max_build_duration: 90
     environment:
@@ -109,26 +111,24 @@ workflows:
       - name: dependencies
         script: |
           set -e
-          brew install -q bison ninja pkg-config
+          brew install -q bison glslang pkg-config
           rm -rf "$HOME/bgvenv"
           python3 -m venv "$HOME/bgvenv"
           # packaging: mesa's mako/yaml version checks import it; distutils fallback
           # is gone in Python 3.12, so without it the check fails as "no mako".
           "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson packaging
-          "$HOME/bgvenv/bin/python3" -c "import mako, yaml, packaging; print('bgvenv mako+packaging ok')"
-      - name: submodules (chlorophyll + mesa + libdrm)
+          "$HOME/bgvenv/bin/python3" -c "import mako, yaml, packaging; print('bgvenv ok')"
+      - name: submodules (chlorophyll + libdrm)
         script: |
           set -e
           git config --global --add safe.directory "$CM_BUILD_DIR" || true
           git submodule update --init --recursive --depth 1 gpu/metal
-          ls gpu/metal/mesa/src/compiler >/dev/null && echo "mesa OK"
           ls gpu/metal/libdrm/include/drm >/dev/null && echo "libdrm OK"
-      - name: build libbgair.dylib
+      - name: build chlorophyll + inject (mesa 26.2.5 clone + turnip, ~35 min)
         script: |
           set -e
-          export GPU_EAGL_VENV="$HOME/bgvenv"
-          "$HOME/bgvenv/bin/python3" -c "import mako, yaml; print('build-step mako ok')"
-          bash tools/ci-build-libbgair-mac.sh
+          bash tools/ci-build-chlorophyll-mac.sh
     artifacts:
-      - out-mac/*.dylib
-      - out-mac/*.log
+      - out-metal/*.dylib
+      - out-metal/bgmtl_*
+      - out-metal/*.log
