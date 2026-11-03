@@ -79,6 +79,32 @@ if [ ! -d "$D/mesa" ]; then
     for f in "$METAL"/air/*; do ln -sf "$f" "mesa/src/compiler/air/$(basename "$f")"; done )
 fi
 
+# Chlorophyll's air/ drifted to newer-Mesa naming after the author's last libbgair
+# build (turnip merge): it uses mesa_shader_stage / mesa_shader_stage_name, which
+# the pinned 25.0.7 does not have (it has gl_shader_stage / _mesa_shader_stage_to_string).
+# Scanned: these are the ONLY missing symbols in the libair.a file set. Idempotent shim:
+python3 - "$D/mesa/src/compiler/shader_enums.h" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+if 'mesa_shader_stage_name' in s:
+    print('shader_enums.h: compat shim already present')
+else:
+    anchor = 'const char *_mesa_shader_stage_to_string(unsigned stage);'
+    assert anchor in s, 'shader_enums.h anchor not found'
+    shim = anchor + '''
+/* Bergamota CI compat: Chlorophyll air/ uses the newer Mesa spelling. */
+typedef gl_shader_stage mesa_shader_stage;
+static inline const char *
+mesa_shader_stage_name(mesa_shader_stage stage)
+{
+   return _mesa_shader_stage_to_string((unsigned)stage);
+}
+'''
+    p.write_text(s.replace(anchor, shim, 1))
+    print('shader_enums.h: mesa_shader_stage compat shim added')
+PY
+
 # ---------------- 5. the cross file (recreated: gpu-eagl's ios-hw.cross is lost)
 cat > "$D/ios-hw.cross" <<EOP
 [binaries]
