@@ -13,8 +13,17 @@ MESON="$VENV/bin/meson"
 OUT="$ROOT/out-mac"
 mkdir -p "$WORK" "$OUT" "$WORK/pc-ios" "$WORK/drm-ios-link"
 
-# hard gate: meson must run under a python that has mako
-"$VENV/bin/python3" -c "import mako, yaml; print('mako gate ok', __import__('sys').version)" || { echo "FATAL: mako not importable in $VENV"; exit 1; }
+# hard gate: replicate mesa's EXACT mako check (needs packaging on py>=3.12,
+# where the distutils fallback no longer exists) + make it importable for any
+# python meson spawns, regardless of how PATH resolves.
+BG_SITE="$VENV/bin/python3 -c"
+export PYTHONPATH="$("$VENV/bin/python3" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')${PYTHONPATH:+:$PYTHONPATH}"
+"$VENV/bin/python3" - <<'GATE' || { echo "FATAL: mesa mako/packaging gate failed for $VENV (PYTHONPATH=$PYTHONPATH)"; exit 1; }
+from packaging.version import Version
+import mako, yaml
+assert Version(mako.__version__) >= Version("0.8.0")
+print("mako gate ok: mako", mako.__version__, "+ packaging + yaml")
+GATE
 
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 echo "== SDK: $SDK"

@@ -112,8 +112,10 @@ workflows:
           brew install -q bison ninja pkg-config
           rm -rf "$HOME/bgvenv"
           python3 -m venv "$HOME/bgvenv"
-          "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson
-          "$HOME/bgvenv/bin/python3" -c "import mako, yaml; print('bgvenv mako ok')"
+          # packaging: mesa's mako/yaml version checks import it; distutils fallback
+          # is gone in Python 3.12, so without it the check fails as "no mako".
+          "$HOME/bgvenv/bin/pip" install -q --upgrade mako pyyaml meson packaging
+          "$HOME/bgvenv/bin/python3" -c "import mako, yaml, packaging; print('bgvenv mako+packaging ok')"
       - name: submodules (chlorophyll + mesa + libdrm)
         script: |
           set -e
