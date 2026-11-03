@@ -101,6 +101,23 @@ for f in "$OUT"/*; do
 done
 cp -f "$WORK/mesa-turnip26/setup-ios.log" "$DEST/" 2>/dev/null || true
 
+# --- SDK header dump for LOCAL (Linux) inject builds: the dylib needs no Apple binaries at link
+# time (-undefined dynamic_lookup resolves on-device), only the headers. With this tarball the
+# laptop's clang+ld64.lld rebuilds bgmtl-inject.dylib in seconds — no 35-min CI round per edit.
+SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+if [ -d "$SDK/usr/include" ]; then
+  HDR="$DEST/sdk-headers"
+  rm -rf "$HDR"; mkdir -p "$HDR/System/Library/Frameworks"
+  cp -R "$SDK/usr/include" "$HDR/usr/include"
+  for fw in Foundation CoreFoundation Metal MetalKit IOSurface QuartzCore CoreGraphics ObjectiveC; do
+    [ -d "$SDK/System/Library/Frameworks/$fw.framework/Headers" ] && \
+      cp -R "$SDK/System/Library/Frameworks/$fw.framework/Headers" "$HDR/System/Library/Frameworks/$fw.framework/Headers"
+  done
+  tar -C "$DEST" -czf "$DEST/sdk-headers.tar.gz" sdk-headers
+  rm -rf "$HDR"
+  echo "== sdk-headers.tar.gz: $(du -h "$DEST/sdk-headers.tar.gz" | cut -f1)"
+fi
+
 echo "== artifacts:"; ls -l "$DEST"
 echo "== get_read_sampler marker in libchlorophyll (must be >=1):"
 grep -c get_read_sampler "$DEST/libchlorophyll.dylib" || true
