@@ -965,3 +965,27 @@ Chronology of the phone round (all gates, no luck):
 - Meters that work: bgmtl.log [pid] perf:/frames: (needs /private/var/tmp/bgmtl.perf), fb stats line
   (swaps_s/copy_s/zc_frames/pool), CPU-time deltas during timed swipes (GPU ~60% bb encode-bound vs
   software 300%+ SpringBoard), A/B eye tests. Console submit lines = first 8 per boot only — do not use.
+
+## 2026-11-04 ~04:00-05:30 — self-healing compositor + the texpool fault lead (art11-13)
+- **Device-lost decoded**: `VkResult -4` after kernel fault recovery = turnip device lost forever; the
+  old dead-man then wrote bgmtl-bb.off → permanent stock. art11: SOFT dead-man — first two deaths in a
+  5-min window exit WITHOUT the kill switch (launchd respawn re-engages on the warm cache, ~10-25 s
+  blip); only the third is a loop and trips for real. Proven live: [431] soft-trip → [683] re-engaged.
+- **art12 second wind**: engages into post-fault chaos can lock CA pacing at 10 Hz for the process's
+  life (uniform 100 ms intervals; also seen at boot-engage, e.g. [64]); a calm restart restores 60.
+  bgmtl_note_frames(fps) hook: after 25 s of sustained <15 fps, one clean exit into the settled system.
+  Boot-scoped marker, refreshed per soft-trip. (Fired 0 times so far — the clamp hasn't recurred.)
+- **THE FAULT SOURCE IS OUR TEXPOOL (mostly)**: A/B under identical hard swiping — pool ON (192 MB):
+  8 kernel faults in 90 s; pool OFF (BGMTL_TEXPOOL_MB=0 in bgmtl-bb.env, zero rebuild): 160 s
+  fault-free... but died to pipeline-compile OOM (VkResult -2, VfxXh+Xhf) — the pool WAS the headroom.
+- **art13 age-gate**: texpool eviction now only takes entries idle >=1 s (under load the LRU was
+  milliseconds old); young puts fall back to normal release. Result: pool back at 192 MB, faults 3-4x
+  down (4 in 3 min vs 8 in 90 s), 59.2 fps reached mid-swipe, one fault cycle self-healed via art11.
+  Residual faults: suspect pool take-reuse (instant handoff) or below in chl — needs the author's
+  kernel fault-attribution sketch (per-IOVA owner logging at fault time).
+- **Deploy protocol after a live overwrite race**: cat > the live dylib raced a respawn → half file →
+  "Library not loaded" crash loop → launchd critical-crash REBOOT (twice tonight). Atomic now:
+  cat > .new, verify md5, mv -f. No more partial-window deploys, no kill before verify.
+- Current on-phone: art13 inject (77956ff4d3e30151a37bef027a2b161a), backboardd LC-wired, posters on,
+  iconservicesagent wired, SpringBoard stock. Env: BGMTL_BB=1 (+BGMTL_SYNC, CA_FORCE_TRIPLE_BUFFERING
+  via bgmtl-bb.env). Boot image: enxerto-boot-scancopy.img (sweetfb_direct/scancopy/swapdepth=2).
