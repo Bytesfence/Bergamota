@@ -908,3 +908,30 @@ Chronology of the phone round (all gates, no luck):
   selector — suspicious; maybe the render server delivers frames via IOSurface scanout, not command-buffer
   presents). Author saw "GPU frames with artifacts" once — the path exists somehow.
 - Phone state: engaged art10, software 3 fps, stable; poster off-switches present. Inject art10 md5 c6e36a6d.
+
+## 2026-11-04 ~01:30 — MILESTONE: 60 fps GPU compositing (scancopy boot + warm engage)
+- **Boot args were the missing present path.** The stock image booted `mode=copy, zc_frames=0`: every frame
+  CPU-copied because zero-copy was never requested. Patched image (byte-append to the boot-args field,
+  437/607 B): `sweetfb_direct=1 sweetfb_scancopy=1 sweetfb_swapdepth=2 sweetgpuboost=7` — image kept at
+  /tmp/opencode/enxerto-boot-scancopy.img. Kernel already had 0211/0216/0235 + probe; no rebuild needed.
+- **Measured**: backboardd `frames: 60.4/60.0/60.1 fps while animating` (intervals 16-25 ms, zero drops);
+  42.5 fps under real home-screen swipes with 50 draws/cbuf; fb swaps 52.9/s. The panel runs hz=59 in this
+  mode (the direct request bumps it from sweetfb_hz=30).
+- **Warm engage matters**: engaged-at-boot backboardd = 10 fps; kill + respawn into a settled system =
+  30-60 fps. Same binary. The settle-then-engage dance is mandatory for benchmarking.
+- **Why the screen still "looks software"**: (1) wallpaper = posters, which were wearing OUR crash-era
+  per-process off switches (now cleared; chain respawns on lock/unlock cycle); (2) no liquid glass =
+  QuartzCore blur gate, the author's known open item (blur radius 0); (3) minor artifacts = the buffer
+  lifecycle race (SMMU CB fault, FAR 0xda0ea080, "recovered; submissions up to N are void", 3-failed-buffers
+  circuit breaker = "3 failed command buffers" in bgmtl-bb.off). Fault seen once in ~5 min of full UI use.
+- **Injection archaeology**: backboardd/posters = LC_LOAD_DYLIB re-signed binaries (author's addlc.py);
+  iconservicesagent re-wired the same way (80 B slack ✓, deployed, then reverted for stability during the
+  SpringBoard incident; binary + .orig in /var/root). SpringBoard: 16 B slack only — LC won't fit; plist
+  DYLD_INSERT worked mechanically but platform-binary launch unnests the DYLD shared region each spawn →
+  freeze on respring; REVERTED (orig in /var/root). SpringBoard still needs a different injection trick.
+- **SMMU probe** blocks zc scanout: `smmu=translate-or-unknown` (probe ran, verbose output swallowed by
+  early console); zc declined → copied. Fixing = kernel SMMU programming for MDP streams 0x880/0xc80
+  (identity CB like the GPU's 0x740 already gets) — drops the ~6.5 ms/frame CPU copy.
+- Meters that work: [pid] perf:/frames: lines in bgmtl.log (perf file /private/var/tmp/bgmtl.perf), fb
+  stats line in kernel console (swaps_s/copy_s/zc_frames), CPU-time deltas during timed swipes
+  (software = 300%+ SpringBoard / GPU = ~60% backboardd encode-bound).
