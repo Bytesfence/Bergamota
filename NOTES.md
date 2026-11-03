@@ -862,3 +862,9 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - tools/sigcheck.py: permanent Mach-O page-hash validator (LC_CODE_SIGNATURE -> SuperBlob -> CodeDirectory; NOTE: CD has a `length` field after magic — omitting it shifts every field). Proven on the old stack: inject d25f42aa 50 pages OK, libdrm d7b1f030 22 OK, libbgair 2319 OK.
 - /tmp/opencode/deploy-metal.sh: one-shot phone round. Gates (sigcheck x3, get_read_sampler>=1, install_name=/usr/local/lib/bgmtl/bgmtl-inject.dylib, deps, md5s) -> phone to fastboot -> ephemeral `fastboot boot enxerto-boot-ios26full.img` -> SSH wait -> push 3 dylibs temp+mv (fresh vnode for the kernel sig cache) -> mv libbgair.dylib aside (the poison) -> sync -> NO REBOOT: backboardd crash-loop respawn loads the new stack -> 1s PID polls + bgmtl.log tail. Kill switch printed at the end. Dry-run gate test passed (stops on missing libchlorophyll).
 - On green CI: download out-metal/, `bash /tmp/opencode/deploy-metal.sh <dir>`, start udplisten.py, user swipes.
+
+## 2026-11-03 (evening) — THE STACK IS BUILT. Bergamota_4 artifacts all-gates-green
+- CI run green end-to-end (ninja fix held: "Found ninja-1.13.2 at bgvenv/bin/ninja"; 916-task compile + build-metal.sh + renegade sign + artifacts).
+- out-metal/ verified locally: sigcheck 15+1017+6 pages OK (NOTE: CI pacstrip signs with 16K pages, author's old ones 4K — sigcheck.py now reads the declared pageSize), get_read_sampler=1, install_name=/usr/local/lib/bgmtl/bgmtl-inject.dylib, deps OK.
+- md5: inject d116deb01e883f0bf17665e9a0d6f15e / libchlorophyll 0c01b0d7dd257c8812a08d1c207c848f / libdrm 97450a551831b045db309da75dadfa28. Artifacts: /tmp/opencode/art4/out-metal/.
+- NEXT: phone round = `bash /tmp/opencode/deploy-metal.sh /tmp/opencode/art4/out-metal` (phone parked in fastboot; temp boot only). Then user swipe test.

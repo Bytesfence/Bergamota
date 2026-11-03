@@ -53,22 +53,24 @@ def check(path):
     (magic, length, version, flags, hash_off, ident_off, n_special, n_code,
      code_limit) = struct.unpack_from(">9I", data, cd_off)
     hash_size, hash_type = data[cd_off + 36], data[cd_off + 37]
+    page_log2 = data[cd_off + 39]
+    page = 1 << page_log2
     if hash_type != 2:  # CSHASH_SHA256
         return fail(path, f"hash type {hash_type} != SHA256")
     if hash_size != 32:
         return fail(path, f"hash size {hash_size} != 32")
-    npages = (code_limit + PAGE - 1) // PAGE
+    npages = (code_limit + page - 1) // page
     bad = 0
     for p in range(npages):
-        start = p * PAGE
-        chunk = data[start:min(start + PAGE, code_limit)]
+        start = p * page
+        chunk = data[start:min(start + page, code_limit)]
         want = data[cd_off + hash_off + p * 32: cd_off + hash_off + p * 32 + 32]
         if hashlib.sha256(chunk).digest() != want:
             bad += 1
     ident = data[cd_off + ident_off: data.index(b"\0", cd_off + ident_off)]
     if bad:
         return fail(path, f"{bad}/{npages} page hashes MISMATCH")
-    print(f"{path}: OK - {npages} pages verified, {n_special} special slots, ident {ident.decode(errors='replace')}")
+    print(f"{path}: OK - {npages} pages ({page//1024}K) verified, {n_special} special slots, ident {ident.decode(errors='replace')}")
     return True
 
 
