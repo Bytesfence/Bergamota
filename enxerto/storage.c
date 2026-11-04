@@ -18,7 +18,10 @@ static int str_eq(const char *a, const char *b)
 /* THE allowlist. Nothing else is ever written, erased or hashed. */
 int stor_name_allowed(const char *name)
 {
-	return str_eq(name, "userdata") || str_eq(name, "boot") || str_eq(name, "logo");
+	/* "win": the iOS root partition (ufsroot=win in the xnu boot-args) lives under that
+	 * GPT name on beryllium; the delta flasher needs to reach it exactly like userdata. */
+	return str_eq(name, "userdata") || str_eq(name, "boot") || str_eq(name, "logo") ||
+	       str_eq(name, "win");
 }
 
 static uint32_t le32(const uint8_t *p)

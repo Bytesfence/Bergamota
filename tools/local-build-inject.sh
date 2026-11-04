@@ -42,12 +42,24 @@ echo "== compile"
 /usr/bin/clang $CFLAGS -c "$ROOT/gpu/metal/inject/bgmtl_inject.m" -o "$OUT/bgmtl_inject.o"
 
 echo "== link"
+# lld-14 cannot read the modern export-trie format of the prebuilt chlorophyll/drm dylibs, so we do not link
+# them directly: every dependency becomes a symbol-less .tbd stub carrying only the install name, and all
+# symbols resolve via -undefined dynamic_lookup (exactly what the CI inject's load commands look like on device).
+TBD="$OUT/tbd"; mkdir -p "$TBD"
+make_tbd() { printf -- "--- !tapi-tbd-v3\narchs: [ arm64e ]\nplatform: ios\ninstall-name: '%s'\n" "$1" > "$TBD/$(echo "$1" | tr '/:@.' '____').tbd"; }
+make_tbd "@rpath/libchlorophyll.dylib"
+make_tbd "@rpath/libdrm.2.dylib"
+make_tbd "/System/Library/Frameworks/Foundation.framework/Foundation"
+make_tbd "/System/Library/Frameworks/Metal.framework/Metal"
+make_tbd "/System/Library/Frameworks/IOSurface.framework/IOSurface"
+make_tbd "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+make_tbd "/usr/lib/libSystem.B.dylib"
 "$LD" -dylib -arch arm64e -platform_version ios 18.0 18.0 \
   -install_name /usr/local/lib/bgmtl/bgmtl-inject.dylib \
   -rpath @loader_path -undefined dynamic_lookup \
   -o "$OUT/bgmtl-inject.dylib" \
   "$OUT/bgmtl.o" "$OUT/bgmtl_inject.o" \
-  "$LIBS_DIR/libchlorophyll.dylib" "$LIBS_DIR/libdrm.2.dylib"
+  "$TBD"/*.tbd
 
 echo "== sign"
 python3 "$ROOT/tools/renegade/pacstrip.py" --sign "$OUT/bgmtl-inject.dylib" >/dev/null

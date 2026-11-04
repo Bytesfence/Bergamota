@@ -989,3 +989,63 @@ Chronology of the phone round (all gates, no luck):
 - Current on-phone: art13 inject (77956ff4d3e30151a37bef027a2b161a), backboardd LC-wired, posters on,
   iconservicesagent wired, SpringBoard stock. Env: BGMTL_BB=1 (+BGMTL_SYNC, CA_FORCE_TRIPLE_BUFFERING
   via bgmtl-bb.env). Boot image: enxerto-boot-scancopy.img (sweetfb_direct/scancopy/swapdepth=2).
+
+## 2026-11-04 ~06:00-08:30 — Enxerto fastboot on win; rootfs delta recovery; attempt-2 verdict
+
+**Enxerto now flashes the iOS root partition.** The kernel roots from the GPT partition named
+`win` (boot-arg `ufsroot=win`; kernel patch 0028 matches GPT names literally), which Enxerto's
+HARD allowlist (userdata/boot/logo) could not touch. Added `win` to `storage.c`
+(stor_name_allowed), `fastboot.c` (fb_part_allowed) and `tools/bergamota-flash.py` (ALLOWED +
+delta-by-default). First hardware flash of win: 4 MiB sent, verified in 413 s (phone+image
+BLAKE2b per 64 KiB, only differing blocks). win = 0x989700000 = 38.15 GiB, image 20 GiB
+(image shorter than partition is fine; both hashes run over the image length).
+
+**Reproducible rootfs recovery (~15 min total):** golden simg (original SpringBoard +
+same-size wired backboardd `/usr/libexec` + iconservicesagent `/System/Library/CoreServices`
+via simg_putfile) -> `bergamota-flash.py flash win` -> boot (clean, NO crash race; dropbear +
+authorized_keys are IN the image) -> push GPU firmware live (a630_* to
+/usr/standalone/firmware/sweet/; the kernel's wait loop picks it up with no reboot, SweetAdreno630
+publishes live) -> promote the MATCHED art13 trio atomically (out-local/bgmtl-inject.dylib
+231664 + art7 libchlorophyll 16699728 + art7 libdrm.2 109152 — all three or none!) -> knobs
+(bgmtl.arm, bgmtl-bb.arm/.direct, bgmtl.faildump) -> kill backboardd BY PID. Phone-side gotchas
+learned the hard way: NO killall (exit 127, silent under 2>/dev/null), no md5 in non-interactive
+SSH PATH (use wc -c; SSH transport is integrity-checked), each inject load TRUNCATES bgmtl.log
+(last writer wins — a missing backboardd line means a later process re-wrote the log, not that
+backboardd didn't load).
+
+**Proven live after recovery (log evidence):** backboardd@art13 `Chlorophyll device registered
+(kernel ABI minor 2)` + pipeline builds; MercuryPoster BGMTLDevice registered (wallpaper engine
+on GPU); GPU stage 8 kept up. The compositing + wallpaper + icons stack survives reboots and
+recovery end to end.
+
+**Attempt-2 verdict (SpringBoard LC surgery, original signature blob kept):** dyld ACCEPTS it
+(zero "unknown platform", zero "Library not loaded") — but two different walls:
+- WARM (respawn in a running system): SpringBoard runs, loads the inject via bgi.dylib, and
+  WEDGES — frozen UI, no crash lines; system stays alive (corpses are its child apps).
+- COLD (boot-time): **launchd boot-task panics "unexpected exec of non-platform binary"** — the
+  string is IN launchd (docs/IOS18_PORT.md:311): it csops-checks platform status of everything
+  it execs during boot tasks and userspace-panics otherwise. Kernel shows it via the sweet early
+  framebuffer (why the user saw it on screen). Our header surgery invalidates the original
+  signature's page hashes -> patch 0036 only marks CS_SIGNED/CS_PLATFORM_BINARY for VALIDATED
+  sigs -> non-platform -> launchd panic.
+
+**Attempt-1/2 matrix:** pacstrip --sign validates (kernel platform OK — backboardd etc. prove
+it) but dyld says "unknown platform" (no platform in the stub: no LC_BUILD_VERSION, and the
+stub's identity lived in the Apple sig we replaced). Original sig carries platform but can never
+validate after header changes. **Attempt-3 path: add LC_BUILD_VERSION (iOS) to the stub + re-sign
+so the sig validates and declares platform — both sides of the matrix in one binary.** Also check
+pacstrip.py for a platform-declaring option; author's addlc'd daemons never hit this because
+launchd's boot check predates their (already validated) re-signed state... verify that theory.
+
+**sweetdenypath does NOT rescue hard-linked daemons:** engage2 wiring is a HARD LC_LOAD_DYLIB;
+deny the path -> dyld aborts at exec -> death spiral (NOTES ~169's "weak inject" wording was
+about the author's weak-linked wiring). Deny-suffix would only work for weak links.
+
+**Twice-burned lesson (both Spirals tonight):** (1) promoted art7 libchlorophyll WITHOUT its
+matching art7 libdrm.2 -> `_drmDevicesEqual` symbol not found -> backboardd crash loop ->
+launchd recovery reboot; (2) attempt-2 left on disk overnight would panic every cold boot. The
+matched-trio-or-none rule and the flash-restore path above are the antidotes.
+
+**Next:** attempt-3 (LC_BUILD_VERSION + validating sig) with sweetsample forensics; bake the
+full working set into the golden image via renegade-rs mkhfs rebuild so recovery is ONE flash
+with zero re-pushes; BGMTL_FAMILY=6 glass experiment only after SpringBoard GPU works.

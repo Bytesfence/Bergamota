@@ -67,7 +67,7 @@ void fb_init(struct fb *fb, const struct fb_transport *t, const struct fb_platfo
 
 int fb_part_allowed(const char *name)
 {
-	return fb_eq(name, "userdata") || fb_eq(name, "boot") || fb_eq(name, "logo");
+	return fb_eq(name, "userdata") || fb_eq(name, "boot") || fb_eq(name, "logo") || fb_eq(name, "win");
 }
 
 /* "OKAY" / "FAIL" / "INFO" / "DATA" + text, at most 64 bytes. */

@@ -42,7 +42,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-ALLOWED = ("userdata", "boot", "logo")
+ALLOWED = ("userdata", "boot", "logo", "win")
 SERIAL = "bergamota0001"
 BLK = 4096
 HASH_BS = 65536
@@ -508,7 +508,7 @@ def flash_partition(dev, part, image_path, mode=None, bs=HASH_BS, verify=True, d
     """Returns a one-line result message. Raises FlashError."""
     check_partition(part)
     if mode is None:
-        mode = "delta" if part == "userdata" else "full"
+        mode = "delta" if part in ("userdata", "win") else "full"
     if not os.path.isfile(image_path):
         raise FlashError(f"{image_path} does not exist")
     if part == "boot":
