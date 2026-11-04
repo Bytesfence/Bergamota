@@ -1180,3 +1180,25 @@ PATH, killall/md5 also absent (use kill-by-pid + wc -c).
 - Open: CI artifact md5s to record when user downloads; kernel FAR-owner attribution tool still
   unbuilt (author's idea, patch 0186 area); renegade-rs mkhfs for baking the working set into the
   image still unbuilt.
+- **art14-local FIRST DEPLOY = backboardd crash -> userspace teardown -> phone parked in recovery env**
+  (2026-11-04 ~19:0x). Sequence: fresh boot (scancopy image, GPU published, MercuryPoster registered
+  on art13) -> deploy-art14.sh pushed the LOCAL trio -> backboardd kill -> one ReportCrash (AKS sel
+  142/17) -> devicerecoverytool -> "Rebooting to device recovery environment" (launchd's critical-
+  daemon path) -> kernel ALIVE, USB gadget down, no SSH/fastboot. **Phone needs the user's buttons:
+  Power+VolDown -> fastboot -> host `fastboot -s 64639c25 boot /tmp/opencode/enxerto-boot-scancopy.img`.
+  Disk state is SAFE: old trio restored by the ladder (verify .old gone + sizes on next boot),
+  original SpringBoard, kill switches cleared -> boots to last-known-good.** Crash report on next
+  boot: /private/var/mobile/Library/Logs/CrashReporter (or /var/root/...) — READ FIRST, it names the
+  faulting image.
+- **Isolation analysis (what we know):** local sigcheck passes on all three (chl 4234 pages 4K,
+  drm 19 pages 4K — 4K-signed ran historically per the author's old arts). art7 CI dylibs are
+  arm64e (subtype 0x80000002); my local chl/drm are plain arm64 — but so is the PROVEN art13 inject
+  (out-local, ran two nights), so subtype alone is not fatal. The deploy swapped ALL THREE including
+  the proven inject = no isolation. **Next test matrix:** (1) CI art14 trio (user downloads; same
+  fix, author's exact toolchain, arm64e) — if it also crashes, the FIX is implicated; (2) hybrid:
+  art13 inject + art7 drm (both proven) + ONLY local/CI chl swapped — isolates the fix exactly.
+- **deploy-art14.sh bugs found post-mortem:** pidof_*/ps helpers had remote-quoting + BSD-ps-leading-
+  spaces bugs (NOTES warned about this!) — returned empty -> false VERDICT-FAIL possible + the ladder's
+  second kill may have hit a mid-dylon-load respawn (contributed to the death spiral). Fixed: remote
+  single-quote helpers with sed pid extraction, +40 s verdict windows, sigcheck gate for all three
+  dylibs before push, hybrid-dir support.
