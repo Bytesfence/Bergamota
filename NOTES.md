@@ -1049,3 +1049,35 @@ matched-trio-or-none rule and the flash-restore path above are the antidotes.
 **Next:** attempt-3 (LC_BUILD_VERSION + validating sig) with sweetsample forensics; bake the
 full working set into the golden image via renegade-rs mkhfs rebuild so recovery is ONE flash
 with zero re-pushes; BGMTL_FAMILY=6 glass experiment only after SpringBoard GPU works.
+
+## 2026-11-04 ~09:30 — ATTEMPT-3b: SPRINGBOARD LOADS ON GPU (surgery solved); blocker moves kernel-side
+
+**The binary formula (a3b, tested live):** original stub, keep LC_BUILD_VERSION (@912 — the byte map
+had mislabeled 0x32 as "LC_NOTE"! it declares platform=2/iOS, minos 0x1a0600 — deleting it caused
+attempt-1's "unknown platform" AND attempt-2's non-platform wedge/panic), keep LC_UUID (dyld REQUIRES
+it for fileset stubs — a3 crashed clean on "missing LC_UUID load command"), drop only
+LC_SOURCE_VERSION (16B), add a 32B LC_LOAD_DYLIB for `/b` (1-char symlink at / -> the inject;
+shrinks the LC from 48B to 32B so UUID+BUILD_VERSION both survive; LCs end exactly at 0x568),
+pacstrip --sign (validates -> kernel CS_PLATFORM_BINARY per patch 0036 -> launchd's boot-task
+csops check passes). Result: SpringBoard loads, inject engages, `com.apple.springboard:
+BGMTLDevice registered in this process (kernel ABI minor 2)` in bgmtl.log. Same shape as
+backboardd's proven wiring. a3/a3b signed copies + builder snippets: /tmp/opencode/SpringBoard.a3b*.
+
+**Cold-boot with a3b not yet tested under supervision** — phone left with ORIGINAL SpringBoard
+overnight; a3b redeploy = push a3b.signed + kill by pid (one command).
+
+**New blocker (the real one): kernel command submission fails on SpringBoard's GPU workload.**
+bgmtl.log: `command buffer failure N: submission failed` x3 in SpringBoard AND backboardd, then
+art11 dead-men wrote bgmtl.off.com.apple.springboard + bgmtl-bb.off and exited (self-stabilized
+stock — visible as missing wallpaper/icons from failed draws + one respring). Same family as the
+BO-in-use/SMMU fault chain (321 leaked BOs era). backboardd's workload survives; SpringBoard's
+trips it immediately. bgmtl-fail/ was EMPTY — pipelines all compiled; it is submission-time, not
+pipeline-build. Next session: sweetsample/sweetiolog during a supervised SpringBoard engage,
+attribution of the failed submissions (kernel log around each), then either kernel-side
+(reuse/leak) or bgmtl encoder retain-recorded-resources work. Per-process kill switches make
+bisecting cheap (touch/remove bgmtl.off.com.apple.springboard).
+
+**Lesson (flash #4, the only spiral tonight that wasn't my breakage):** after ANY crash verdict on
+a deployed test binary, restore the original IN THE SAME SCRIPT — the a3 UUID crash looped to
+launchd's limit while I was building a3b. The verdict-restore ladder is now baked into the test
+script pattern (25s window -> crash reason? -> auto-restore -> report).
