@@ -1202,3 +1202,11 @@ PATH, killall/md5 also absent (use kill-by-pid + wc -c).
   second kill may have hit a mid-dylon-load respawn (contributed to the death spiral). Fixed: remote
   single-quote helpers with sed pid extraction, +40 s verdict windows, sigcheck gate for all three
   dylibs before push, hybrid-dir support.
+- **Inject EXONERATED:** local inject md5 77956ff4d3e30151a37bef027a2b161a == the deployed art13
+  inject (out-local) — byte-identical build. Crash variables: only local libchlorophyll (fix or
+  local build) or local libdrm. **/tmp/opencode/hybrid-chl/ prepared: art13 inject + art7 drm +
+  local chl only** — the clean single-variable test. deploy-art14.sh v2 supports hybrid dirs
+  (missing file = keep on-phone), sigcheck-gates every dylib, fixed remote-quoting pid helpers,
+  45 s verdict windows. Next-boot protocol: (1) button combo to fastboot, fastboot boot scancopy;
+  (2) READ CRASH REPORT FIRST (/private/var/mobile/Library/Logs/CrashReporter, newest backboardd
+  ips) — it names the faulting image; (3) then hybrid-chl or CI trio per the matrix above.
