@@ -1081,3 +1081,32 @@ bisecting cheap (touch/remove bgmtl.off.com.apple.springboard).
 a deployed test binary, restore the original IN THE SAME SCRIPT — the a3 UUID crash looped to
 launchd's limit while I was building a3b. The verdict-restore ladder is now baked into the test
 script pattern (25s window -> crash reason? -> auto-restore -> report).
+
+## 2026-11-04 ~10:15 — tonight's failure chain fully attributed (author's open bug, exact match)
+
+Fork current with origin (37a7a7a); the author's chl fixes (7d34aac nir_lower_returns,
+9dd07a9 wrapped-IOSurface copy) ARE ancestors of our art builds. The author's NOTES
+(2026-10-26 boots 51-53) describe THIS bug: SpringBoard on chl faults while drawing icon
+images (primitive_image / plane_image_stretch), FARs in the kernel GVM range, 3-recovery
+budget then GPU lost until reboot. They left SpringBoard parked on kill switches with a
+fresh-boot re-test plan — the same place we park tonight.
+
+Tonight's chain (console line-correlated): a3b SpringBoard engaged -> 2 SMMU faults
+(FAR 0x0e175df00 + 0x0e1675700, same ~2 MiB region, CB1 FSR 0x400, FSYNR0 0x1) ->
+RECOVERY 2/3 then 3/3 -> GPU dead for the rest of the boot -> every later
+"submission failed" (backboardd AND SpringBoard) is a dead GPU, not new failures ->
+art11 dead-men -> stock. "Framerate unchanged" = GPU already lost when a3b ran; the
+earlier backboardd cycles had burned 1 recovery before SpringBoard even joined.
+
+KEY LEAD: `copied, not imported` (the 9dd07a9 verification line) NEVER appears in the
+log — SpringBoard's icon surfaces are NOT being caught by the wrapped-surface
+detection, so they are still imported/mapped, not copied. Tomorrow: fresh boot (resets
+the recovery budget), deploy a3b ONLY after confirming recoveries=0, watch for
+copied-not-imported + the fault attribution. If surfaces bypass detection: find their
+import path in chl (IOSurface plane walkers?) and either widen the copy heuristic or
+fix the real lifecycle bug. Author's kernel idea worth building: fault report names the
+owner of FAR (pid whose GEM covers it, or "freed N ms ago by pid P") — patch 0186 area
+has the client list. Also: /private/var/tmp/chl.tudebug -> TU_DEBUG per process
+(sysmem ruled GMEM out for the author); /var/root/sweetgpu (build from
+gpu/kernel-test/sweetgpu.c) reads kern.sweet_gpu — no sysctl in non-interactive SSH
+PATH, killall/md5 also absent (use kill-by-pid + wc -c).
