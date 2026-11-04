@@ -1110,3 +1110,73 @@ has the client list. Also: /private/var/tmp/chl.tudebug -> TU_DEBUG per process
 (sysmem ruled GMEM out for the author); /var/root/sweetgpu (build from
 gpu/kernel-test/sweetgpu.c) reads kern.sweet_gpu — no sysctl in non-interactive SSH
 PATH, killall/md5 also absent (use kill-by-pid + wc -c).
+
+## 2026-11-04/05 — ROOT CAUSE FOUND (render attachments never retained); art14 committed; THE LOCAL TURNIP BUILD WORKS
+- **The SpringBoard icon-fault root cause (this is the fix the whole icon saga pointed at):**
+  `chl_render_begin` (air/chl_render.c.inc) builds its VkRenderingAttachmentInfo from the pass's
+  color/depth/stencil/resolve textures but never `cb_hold`s ANY of them — every other path does
+  (sampled textures chl_vk.c:2094, buffers :2069, pipelines :2208, blit src/dst :2268+). bgmtl.m:240
+  documents CA's lifecycle as an assumption: CoreAnimation makes its offscreen targets (blur pyramid,
+  glass passes, full-screen RGBA16F copies) ANEW EVERY FRAME and releases them right after recording,
+  trusting "chl retains what it records". It does — everywhere except pass attachments. Released
+  attachment -> VkImage/VkDeviceMemory freed -> kernel GEM close -> SMMU mapping torn down while the
+  GPU still renders into it -> the icon-time faults (author boots 51-53 + our 11-04/05: 3 recoveries
+  in the first ~30 s of a3b, FARs 0x0a5691180 / 0x0d132c600 x2, different every boot = stale pointers,
+  not one bad buffer). "copied, not imported" never fires because icon surfaces are proper chl BOs
+  shared cross-process (import fine, not SWEET_GPU_SBO_WRAPPED) — the author's 9dd07a9 fix addressed
+  a different surface class. Fix = ~10 lines: cb_hold all non-null attachments + resolves in
+  chl_render_begin. **Commit ada6e55 on Bytesfence/Chlorophyll completion-queue (art14), parent bump
+  6f372c8 on Bytesfence/Bergamota develop, both pushed.** CI: user triggered "chlorophyll (iOS turnip
+  stack)" on 6f372c8 (~35 min, artifact = authoritative matched trio).
+- **THE LOCAL DEBIAN TURNIP BUILD IS PROVEN** (user's directive: avoid Codemagic; the "preflight"
+  tool at /tmp/opencode/chlwork was never production — today it became one). Full 701-target
+  ninja + dylib + sign + gates green. Bugs found and fixed, in order:
+  1. `bin/xcrun` shim: `eval set --` INSIDE strip_darwin retargets the FUNCTION's $@, not the
+     caller's — every compile silently kept meson's `-isysroot` (old mixed sysroot) and `-arch`.
+     Fix: function printf's the stripped list; caller does `eval "set -- $(strip_darwin "$@")"`.
+     (My "STRIPPED-OK" probe passed because an empty TU needs no headers — test with real files.)
+  2. glslang: Debian 11.12 lacks `-P<pragma>` injection (bvh shaders need >=12). chlwork/bin now
+     execs glslang 16.6.0 release binary (bin/glslangValidator, downloaded from KhronosGroup releases).
+  3. The old mesa-air sysroot was a GLIBC-MIXED incoherent set (features.h, sys/_types typedef
+     clashes). Replaced: cc-ios/cxx-ios `--sysroot` -> /mnt/bergamota/research/mesa-air/iossdk-sysroot
+     (coherent copy of /tmp/opencode/iossdk). Six apple-stub headers that shadowed real SDK headers
+     (malloc, mach, endian, pthread, mach-o/loader, sysctl) deleted — stubs remain only for what the
+     SDK dump lacks. apple-stub/mach-o/loader.h KEPT (stub) + extended with struct mach_header,
+     MH_MAGIC/MH_CIGAM (build_id.c needs them; SDK dump has no mach-o/).
+  4. Meson link-probes lied via `-undefined dynamic_lookup` (author's NOTES line 844 was RIGHT and
+     we reproduced it): wrapper now adds dynamic_lookup ONLY for -shared/-dynamiclib/-bundle links;
+     executables get -Wl,-undefined,error. Honest results: HAVE_MEMFD_CREATE=0, HAVE_DLADDR=0 (=
+     author's CI state; disk_cache.h's Dl_info block compiles away — it uses Dl_info WITHOUT
+     including dlfcn.h, relying on HAVE_DLADDR=0 on darwin).
+  5. -D_DARWIN_C_SOURCE in cc/cxx-ios (std=c11 strict mode otherwise hides guarded extensions).
+  6. Stub libs for the link: libdl/librt/libm/libpthread/libresolv/libz/libstdc++/libc++ (copies of
+     stub-lib/libSystem.dylib — empty stub; real symbols resolve on-device via dynamic_lookup).
+     pc-ios/zlib.pc redirects zlib to the stub (host /usr/lib libz.so is ELF x86).
+  7. C++: apt libc++-dev; cxx-ios gets -nostdinc++ -isystem /usr/include/c++/v1 +
+     -Wno-c++11-narrowing (turnip headers narrow non-constants; Apple clang tolerates).
+  8. IOKit: SDK dump has no framework headers; apple-stub/IOKit/IOKitLib.h extended with
+     IOConnectMapMemory64/UnmapMemory64 decls; minimal .tbd framework stubs written into
+     iossdk-sysroot/System/Library/Frameworks/{IOKit,CoreFoundation}.framework for -framework links.
+  9. libdrm stand-in built locally (gpu/freedreno-sweet/build.sh + shim on PATH): 74896 B, signed.
+  10. meson reconfigure after coredata.dat removal needs the FULL option set + --cross-file again.
+- **Artifacts (local, matched trio): /tmp/opencode/art14-local/** — bgmtl-inject.dylib 231664 B
+  (md5 77956ff4d3e30151a37bef027a2b161a, sigcheck 57 pages OK), libchlorophyll.dylib 17475968 B
+  signed (get_read_sampler=1, id @rpath/libchlorophyll.dylib, dep @rpath/libdrm.2.dylib),
+  libdrm.2.dylib 74896 B. NOTE: inject source is IDENTICAL to art13 (fix lives in libchlorophyll),
+  so art13-inject + local-chl + local-drm is also a valid trio if the CI artifact needs a retry.
+- **Build recipe (repeatable):** PATH=/tmp/opencode/venv/bin:/tmp/opencode/chlwork/bin:$PATH;
+  ninja -j4 -C /tmp/opencode/chlwork/build-ios src/freedreno/vulkan/libchlorophyll.dylib;
+  ~/ios-beryllium/tools/renegade/renegade strip --sign -o art/libchlorophyll.dylib <build-out>;
+  bash gpu/freedreno-sweet/build.sh /tmp/opencode/chlwork/drm-ios (if drm changed);
+  bash tools/local-build-inject.sh <libs-dir> <libs-dir>. Air/ sources compile via symlinks from
+  mesa-src-26.2.5/src/compiler/air -> repo gpu/metal/air (edit repo, rebuild — no copy step).
+- **Deploy plan (next boot):** fresh boot (resets the 3-recovery budget) -> verify RECOVERY 0 ->
+  push the CI trio (authoritative; user downloads out-metal) or art14-local -> backboardd restart
+  first, register check, then SpringBoard kill by pid -> watch copied-lines/SMMU/bgmtl.log ->
+  verdict-restore ladder IN THE SAME SCRIPT (restore = old trio .old copies + kill by pid).
+  Phone left stable overnight on original SpringBoard + kill switches absent (bgmtl-bb.off,
+  bgmtl.off.com.apple.springboard were cleared this morning before the a3b test; a3b IS still
+  deployed as the SpringBoard binary from the morning test — original is /tmp/opencode/SpringBoard.work).
+- Open: CI artifact md5s to record when user downloads; kernel FAR-owner attribution tool still
+  unbuilt (author's idea, patch 0186 area); renegade-rs mkhfs for baking the working set into the
+  image still unbuilt.
