@@ -166,3 +166,42 @@ workflows:
           ls -l "$DEST"
     artifacts:
       - out-metal/sdk-headers.tar.gz
+
+  # Bergamota GL payload (the GLES route, docs/GPU_EAGL.md): Mesa 25.0.7 cross-built for
+  # iOS arm64e — OSMesa ES frontend, gallium softpipe + freedreno/a6xx over the SweetAdreno
+  # libdrm stand-in (gpu/freedreno-sweet) — plus the OpenGLES injection shim and bgl-launch,
+  # packaged as the payload the Renegade "bglrender" root tweak installs into
+  # /usr/local/lib/bergamota-gl/. Author scripts unmodified: gpu/eagl/mesa/build-mesa.sh
+  # (self-stages its venv + mesa/libdrm clones into GPU_EAGL_WORK) + gpu/eagl/make-payload.sh.
+  # Manual trigger only (Start new build -> bergamota-gl (GLES payload)).
+  bergamota-gl:
+    name: bergamota-gl (GLES payload)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: latest
+    scripts:
+      - name: dependencies
+        script: |
+          set -e
+          # bison: build-mesa.sh reads $(brew --prefix bison); ninja: the runner image has
+          # none and meson aborts at the end of configure without it (see chlorophyll notes)
+          brew install -q bison ninja pkg-config
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+      - name: build mesa (OSMesa ES, softpipe + freedreno/a6xx)
+        script: |
+          set -e
+          git config --global --add safe.directory "$CM_BUILD_DIR" || true
+          export GPU_EAGL_WORK="$CM_BUILD_DIR/glwork"
+          bash gpu/eagl/mesa/build-mesa.sh
+          ls -l "$GPU_EAGL_WORK/build-hw/src/gallium/targets/osmesa/libOSMesa.8.dylib"
+      - name: package payload (shim + bgl-launch, pacstrip --sign)
+        script: |
+          set -e
+          export GPU_EAGL_WORK="$CM_BUILD_DIR/glwork"
+          bash gpu/eagl/make-payload.sh "$CM_BUILD_DIR/out/bergamota-gl"
+          cat "$CM_BUILD_DIR/out/bergamota-gl/MANIFEST.sha256"
+          du -sh "$CM_BUILD_DIR/out/bergamota-gl"
+    artifacts:
+      - out/bergamota-gl/**
