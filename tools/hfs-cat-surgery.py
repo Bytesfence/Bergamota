@@ -58,6 +58,11 @@ def find_file_record(part, exts, name):
         data = read_phone(part, eo, el)
         i = data.find(needle)
         while i != -1:
+            # exact-name gate: longer names (libchlorophyll.dylib.a15/.old) contain the needle
+            # as a prefix and would otherwise be surgically overwritten by mistake
+            if struct.unpack_from(">H", data, i - 2)[0] != len(name):
+                i = data.find(needle, i + 2)
+                continue
             klen = struct.unpack_from(">H", data, i - 8)[0]
             rec = i - 8 + 2 + klen
             if struct.unpack_from(">H", data, rec)[0] == 2:   # kHFSPlusFileRecord
