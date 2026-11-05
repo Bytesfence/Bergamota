@@ -181,7 +181,7 @@ workflows:
         KERNEL_CONFIG: DEVELOPMENT
         MACHINE_CONFIG: SWEET
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
-        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73b9511549
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
         CCACHE_DIR: $CM_BUILD_DIR/.ccache
         CCACHE_COMPRESS: "1"
         CCACHE_MAXSIZE: 2G
@@ -242,12 +242,15 @@ workflows:
           tail -40 build.log
           exit $rc
       - name: Collect kernel + logs
+        working_directory: dxb
         script: |
-          set -e
-          mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          set +e
+          mkdir -p "$CM_BUILD_DIR/out"
+          cp -R fakeroot/System/Library/Kernels/. "$CM_BUILD_DIR/out/" 2>/dev/null || true
+          (cd "$CM_BUILD_DIR/out" && shasum -a 256 kernel.* > SHA256SUMS) || true
+          gzip -c build.log > "$CM_BUILD_DIR/out/build.log.gz" || true
+          ls -la "$CM_BUILD_DIR/out"
+          exit 0
     artifacts:
       - out/**
 
