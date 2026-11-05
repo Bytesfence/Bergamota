@@ -170,14 +170,19 @@ workflows:
   # Heartwood kernel xnu-11215 (15.3, SWEET) — the iOS 18-generation kernel, the author's
   # proven combo for the 18.7.8 root + GLES route (release milestone-ios18-xnu11215, CI run
   # 39976128381). Same shape as xnu-265-sweet: dxb patches/15.0 staging, ours after with the
-  # sweet- prefix, Xcode 16.x selection. Manual trigger only (Start new build -> xnu-11215).
+  # sweet- prefix. TOOLCHAIN: the 16.2 machine image (docs/XNU11215_MIGRATION.md L14: Xcode 16.2
+  # + KDK 15.3 via dxb + RC_DARWIN_KERNEL_VERSION=24.3.0). Do NOT build on the default image —
+  # its Xcode 26 clang rejects 11215's stock skywalk/nexus __counted_by code (hard errors, not
+  # warnings). Manual trigger only (Start new build -> xnu-11215).
   xnu-11215-sweet:
     name: Heartwood kernel xnu-11215 (15.3, SWEET)
     max_build_duration: 120
     instance_type: mac_mini_m2
     environment:
+      xcode: "16.2"
       vars:
         MACOS_VERSION: 15.3
+        RC_DARWIN_KERNEL_VERSION: 24.3.0
         KERNEL_CONFIG: DEVELOPMENT
         MACHINE_CONFIG: SWEET
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
