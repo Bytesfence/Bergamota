@@ -110,6 +110,7 @@ typedef struct {                    // attachImage:toCoreSurface:invertedRender:
     BOOL inverted;
     int direct;                     // the texture IS the surface memory (BGL_DIRECT): no blit, only finish + BO_SYNC
     int dirty;                      // drawn into (or newly attached) since the last sync: display-size attachments are copied only when dirty
+    int blit_ok, blit_tried;        // GPU blit to this surface: verified delivering (blit_ok), attempted at least once (blit_tried)
 } Attach;
 
 struct _EAGLSharegroupPrivate {
@@ -617,7 +618,8 @@ static void verify_direct(EAGLContext *c, Attach *a) {
 
 static void (*mesa_glFlush)(void), (*mesa_glFinish)(void);   // tentative: defined with the flush wrappers below; sync_att needs the finish first
 
-static void glyph_survival_check(void);   // defined with the flip probes: did the glyph draw's pixels survive to the flush?
+static void glyph_survival_check(IOSurfaceRef surf, int direct);   // defined with the flip probes: did the glyph draw's pixels land in surface memory at sync?
+static int g_gpu_blit(void) { static int v = -1; if (v < 0) v = getenv("BGL_GPU_BLIT") != NULL; return v; }   // default OFF: the blit can silently write nothing
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
@@ -626,7 +628,7 @@ static void sync_att(EAGLContext *c, int i) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             { static unsigned nd; if (g_debug && nd++ < 4000) EAGL_DEBUG("direct_sync surface %u (dirty flush)\n", IOSurfaceGetID(a->surf)); }
             if (g_debug_frames) verify_direct(c, a);
-            glyph_survival_check();
+            glyph_survival_check(a->surf, 1);
             return;
         }
         mesa_glFinish();   // glFlush only SUBMITTED the batch (the clock's digits read back as all-zero for exactly this reason: the GPU was still rendering when the sync copied the texture)
@@ -634,7 +636,13 @@ static void sync_att(EAGLContext *c, int i) {
         // Hardware path: the GPU copies the image into the surface (no readback); GL rows are bottom-up, `inverted` means the surface wants them as they are.
         double t_start = g_debug ? now_ms() : 0;
         BOOL flip = a->kind ? a->inverted : !a->inverted;      // target-form attach (the render server): YES = rows flipped, NO = as GL has them (seen on the phone: NO + flip drew the UI upside down)
-        if (osm_sweet_active() && (uint64_t)IOSurfaceGetWidth(a->surf) * IOSurfaceGetHeight(a->surf) >= 1000000 && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {   // GPU blit only for display-size: its writes into pitch-aligned smaller surfaces (772x164 clock, bpr 3328) silently left the surface empty while returning success; the CPU readback below is the proven path for small surfaces
+        // Delivery for content surfaces (non-direct): the GPU blit historically SILENTLY wrote nothing for some
+        // surfaces while returning success, and a first-sync verification is impossible (the texture was created by
+        // copying the surface, so GL and BO are identical until real content diverges). CPU readback is the proven
+        // path; BGL_GPU_BLIT re-enables the blit for experiments.
+        if (g_gpu_blit() && osm_sweet_active() && (uint64_t)IOSurfaceGetWidth(a->surf) * IOSurfaceGetHeight(a->surf) >= 1000000 && osm_sweet_blit(a->name, isTex, IOSurfaceGetID(a->surf), flip, NO)) {
+            { static unsigned nb; if (g_debug && nb++ < 400) EAGL_DEBUG("blit-sync surface %u tex %u ok\n", IOSurfaceGetID(a->surf), a->name); }
+            glyph_survival_check(a->surf, 0);
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
             return;
         }
@@ -664,7 +672,7 @@ static void sync_att(EAGLContext *c, int i) {
         }
         if (!buf) buf = read_image(c, a->name, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), &w, &h);
         if (buf) {
-            if (g_debug) { static unsigned nq; if (nq++ < 60) { size_t tot = (size_t)w * h * 4, nz = 0; size_t y0 = 0, y1 = 0; for (size_t y = 0; y < h; y++) { size_t rn = 0; for (size_t x = 0; x < w * 4; x++) if (buf[y * w * 4 + x]) rn++; if (rn) { nz += rn; if (!y0) y0 = y; y1 = y; } } EAGL_DEBUG("cpu-sync surface %u: GL image %ux%u, %zu of %zu bytes non-zero, rows %zu-%zu\n", IOSurfaceGetID(a->surf), w, h, nz, tot, y0, y1); } }
+            if (g_debug) { static unsigned nq; if (nq++ < 400) { size_t tot = (size_t)w * h * 4, nz = 0; size_t y0 = 0, y1 = 0; for (size_t y = 0; y < h; y++) { size_t rn = 0; for (size_t x = 0; x < w * 4; x++) if (buf[y * w * 4 + x]) rn++; if (rn) { nz += rn; if (!y0) y0 = y; y1 = y; } } EAGL_DEBUG("cpu-sync surface %u: GL image %ux%u, %zu of %zu bytes non-zero, rows %zu-%zu\n", IOSurfaceGetID(a->surf), w, h, nz, tot, y0, y1); } }
             // GL rows are bottom-up; a "normal" surface is top-down. invertedRender means CA already drew it flipped.
             rgba_to_surface(buf, w, h, a->surf, flip, NO);
             free(buf);
@@ -804,7 +812,7 @@ static void flip_delta_begin(void) {
 // Later same-frame draws (backdrop snapshots, full-screen fills) may bury it before the flush - or it reaches the
 // surface intact and the loss is below GL. Record the glyph draw's changed pixels and re-read them at that flip's
 // flush (sync time) to see which fate it met.
-static int g_gw_on; static GLint g_gw_fbo; static size_t g_gw_n; static size_t *g_gw_idx; static uint8_t *g_gw_pre; static uint8_t *g_gw_now;
+static int g_gw_on; static GLint g_gw_fbo; static size_t g_gw_n; static size_t *g_gw_idx; static uint8_t *g_gw_pre; static uint8_t *g_gw_now; static uint8_t *g_gw_post;
 static void flip_delta_end(const char *what, GLsizei count) {
     if (!flip_pre_on) return; flip_pre_on = 0;
     static uint8_t *post; if (!post) post = malloc((size_t)828 * 1792 * 4);
@@ -817,29 +825,63 @@ static void flip_delta_end(const char *what, GLsizei count) {
     GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
     EAGL_DEBUG("flip-draw (%s, count %d): tex %u (%ux%u) into fbo %d: non-zero before %zu after %zu, %zu px RGB-changed, %zu px alpha-only\n",
                what, count, flip_pre_tex, flip_pre_w, flip_pre_h, fb, flip_pre_nz, nz, chg, chgA);
-    if (chg && chg < 5000 && !g_gw_on) {     // a small real-color draw (glyph/text): watch its pixels until the flush
-        if (!g_gw_idx) { g_gw_idx = malloc(sizeof(size_t) * 8192); g_gw_pre = malloc((size_t)828 * 1792 * 4); g_gw_now = malloc((size_t)828 * 1792 * 4); }
-        if (g_gw_idx && g_gw_pre && g_gw_now) {
+    // Cover-diff map: the frame's last draw paints an imported 828x1792 scene surface OPAQUELY over the flip - the
+    // displayed image IS that import. Diff the incoming cover against the flip's composed (pre-cover) content per
+    // coarse band: equal bands = the import tracks our composition (snapshot semantics); differing bands = content
+    // present in the flip that the import lacks (the lost UI, mapped).
+    if (flip_pre_w == 828 && flip_pre_h == 1792) {
+        static unsigned nc;
+        if (nc < 6) {
+            nc++;
+            EAGL_DEBUG("cover-diff tex %u into fbo %d: 12x24 grid of RGB-differing px (cover vs composed flip)\n", flip_pre_tex, fb);
+            for (int r = 0; r < 24; r++) {
+                char buf[112]; int off = 0;
+                int y0 = r * 74, y1 = (r + 1 == 24) ? 1792 : (r + 1) * 74;
+                for (int c2 = 0; c2 < 12; c2++) {
+                    int x0 = c2 * 69, x1 = (c2 + 1 == 12) ? 828 : (c2 + 1) * 69;
+                    size_t d = 0;
+                    for (int y = y0; y < y1; y++) {
+                        const uint8_t *a = &post[(size_t)y * 828 * 4 + (size_t)x0 * 4];
+                        const uint8_t *b = &flip_pre_buf[(size_t)y * 828 * 4 + (size_t)x0 * 4];
+                        for (int x = x0; x < x1; x++, a += 4, b += 4)
+                            if (a[0] != b[0] || a[1] != b[1] || a[2] != b[2]) d++;
+                    }
+                    off += snprintf(buf + off, sizeof(buf) - off, "%zu,", d);
+                }
+                EAGL_DEBUG("  r%02d: %s\n", r, buf);
+            }
+        }
+    }
+    if (chg && chg < 5000) {     // a small real-color draw (glyph/text): watch its pixels until the flush (re-arm every time:
+        if (!g_gw_idx) { g_gw_idx = malloc(sizeof(size_t) * 8192); g_gw_pre = malloc((size_t)828 * 1792 * 4); g_gw_now = malloc((size_t)828 * 1792 * 4); g_gw_post = malloc((size_t)828 * 1792 * 4); }
+        if (g_gw_idx && g_gw_pre && g_gw_now && g_gw_post) {
             g_gw_n = 0;
             for (size_t q = 0; q < (size_t)828 * 1792 * 4 && g_gw_n < 8192; q += 4)
                 if (post[q] != flip_pre_buf[q] || post[q+1] != flip_pre_buf[q+1] || post[q+2] != flip_pre_buf[q+2]) g_gw_idx[g_gw_n++] = q;
-            if (g_gw_n) { memcpy(g_gw_pre, flip_pre_buf, (size_t)828 * 1792 * 4); g_gw_fbo = fb; g_gw_on = 1; }
+            if (g_gw_n) { memcpy(g_gw_pre, flip_pre_buf, (size_t)828 * 1792 * 4); memcpy(g_gw_post, post, (size_t)828 * 1792 * 4); g_gw_fbo = fb; g_gw_on = 1; }
         }
     }
 }
-static void glyph_survival_check(void) {
-    if (!g_gw_on) return;
+// At the watched flip's sync: read the SURFACE MEMORY directly (CPU map - no GL call, so no forced GMEM resolve can
+// mask staleness) and score the glyph pixels against the draw's pre/post images. match-post high => our GPU writes
+// landed in the surface (the compositor must be reading elsewhere/stale); match-pre high => the sync never stored the
+// draw's output (fd6 store/coherency problem in the direct path).
+static void glyph_survival_check(IOSurfaceRef surf, int direct) {
+    if (!g_gw_on || !surf) return;
     GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
     if (fb != g_gw_fbo) return;                     // only check at the watched flip's own sync
     g_gw_on = 0;
-    glFinish();
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, 828, 1792, GL_RGBA, GL_UNSIGNED_BYTE, g_gw_now);
-    size_t alive = 0; for (size_t i = 0; i < g_gw_n; i++) {
-        size_t q = g_gw_idx[i];
-        if (g_gw_now[q] != g_gw_pre[q] || g_gw_now[q+1] != g_gw_pre[q+1] || g_gw_now[q+2] != g_gw_pre[q+2]) alive++;
+    size_t bpr = IOSurfaceGetBytesPerRow(surf);
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+    if (!base || !bpr) return;
+    size_t mp = 0, mpre = 0;
+    for (size_t i2 = 0; i2 < g_gw_n; i2++) {
+        size_t q = g_gw_idx[i2]; size_t px = q / 4; size_t x = px % 828, y = px / 828;
+        const uint8_t *s = base + y * bpr + x * 4;
+        if (s[0] == g_gw_post[q] && s[1] == g_gw_post[q+1] && s[2] == g_gw_post[q+2]) mp++;
+        if (s[0] == g_gw_pre[q] && s[1] == g_gw_pre[q+1] && s[2] == g_gw_pre[q+2]) mpre++;
     }
-    EAGL_DEBUG("glyph-survival: %zu of %zu changed px still present at flush of fbo %d\n", alive, g_gw_n, fb);
+    EAGL_DEBUG("glyph-survival: %zu watched px: surface memory matches post-draw %zu, pre-draw %zu (bpr %zu, att direct %d)\n", g_gw_n, mp, mpre, bpr, direct);
 }
 // Feedback-loop renders: CA's GLES renderer repeatedly draws a texture INTO the framebuffer that same texture is
 // attached to (progressive accumulation: the clock/date caches, CC glass passes, e.g. units (140,139) into fbo 42 = tex
@@ -886,8 +928,29 @@ static void feedback_fix_end(void) {
     glActiveTexture((GLenum)sAct);
     fbfix_n = 0;
 }
-static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawArrays(a, b, c); feedback_fix_end(); if (g_debug) draw_probe("arrays", c); flip_delta_end("arrays", c); }
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawElements(a, b, c, d); feedback_fix_end(); if (g_debug) draw_probe("elements", b); flip_delta_end("elements", b); }
+// Nocover experiment (toggle: /private/var/tmp/bgl-nocover): the frame's last draw paints an imported 828x1792
+// scene surface OPAQUELY over the display flip - the displayed image IS that import, and GL-composed elements
+// (clock, CC tiles) die under it. Skipping those draws shows what the GL side actually composes: if the clock
+// appears (over a broken backdrop), display = flip and the scene import is the delivery path that loses the
+// GL-origin content. Gated past boot splash (draw #3000+).
+static long g_draw_total; static int g_nocover = -1;
+static int cover_skip(void) {
+    if (g_nocover < 0) g_nocover = (access("/private/var/tmp/bgl-nocover", F_OK) == 0);
+    if (!g_nocover || g_draw_total < 300) return 0;   // past boot splash (~#154), before first cover (~#519)
+    GLint act = 0; glGetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &act);
+    glActiveTexture(GL_TEXTURE0);
+    GLint t = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+    glActiveTexture((GLenum)act);
+    if (!t) return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_live_lock);
+    for (int i = 0; i < g_nlive; i++) if (g_live[i].name == (GLuint)t && !g_live[i].wrapped && g_live[i].w == 828 && g_live[i].h == 1792) { hit = 1; break; }
+    pthread_mutex_unlock(&g_live_lock);
+    if (hit) { static unsigned ns; if (ns++ < 30) EAGL_DEBUG("cover-skip: draw of imported scene tex %u skipped (nocover)\n", (unsigned)t); }
+    return hit;
+}
+static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); g_draw_total++; if (cover_skip()) return; mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawArrays(a, b, c); feedback_fix_end(); if (g_debug) draw_probe("arrays", c); flip_delta_end("arrays", c); }
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); g_draw_total++; if (cover_skip()) return; mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawElements(a, b, c, d); feedback_fix_end(); if (g_debug) draw_probe("elements", b); flip_delta_end("elements", b); }
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { ctxless_warn("glDrawArraysInstanced"); mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
@@ -1288,6 +1351,19 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
 - (BOOL)presentRenderbuffer:(NSUInteger)target afterMinimumDuration:(CFTimeInterval)d { return [self presentRenderbuffer:target]; }
 
 // --- IOSurface ---
+// Direct attach only for the PRESENT rotation: GPU writes into direct-attached textures never reached the surface
+// memory (glyph-survival: post-draw 0, pre-draw 560/560 with att direct 1) - on this kernel the alias looks writable
+// but the renders are dropped, so any consumer of the IOSurface (CA's scene compositor building the imported
+// backdrop) sees stale bytes and every GL-composed element (clock, CC tiles) vanishes. The PRESENTED flips (730/732)
+// display fine because present shows the flip's final GL state through its own path, not the BO. CA re-attaches the
+// present surfaces every frame; content surfaces (layers) are attached once or twice - so only surfaces seen 3+ times
+// before may go direct, everything else keeps private storage + a delivering sync (verified blit, else CPU readback).
+static struct { uint32_t id; unsigned n; } g_attcount[128]; static int g_nattcount;
+static unsigned att_seen(uint32_t id) {              // returns the PRIOR count, increments
+    for (int i = 0; i < g_nattcount; i++) if (g_attcount[i].id == id) return g_attcount[i].n++;
+    if (g_nattcount < 128) { g_attcount[g_nattcount].id = id; g_attcount[g_nattcount].n = 1; }
+    return 0;
+}
 - (BOOL)attachImage:(NSUInteger)image toCoreSurface:(IOSurfaceRef)surface invertedRender:(BOOL)inverted {
     // `image` is a GL TARGET (CoreAnimation passes GL_TEXTURE_2D = 3553, found by dumping the server's calls on the phone): the image
     // currently bound at that target gets the IOSurface as its storage. A plain object name (our own tests) is still accepted.
@@ -1310,7 +1386,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            if (g_direct && !inverted && osm_sweet_active() && IOSurfaceGetPixelFormat(surface) == 'BGRA' && (IOSurfaceGetBytesPerRow(surface) & 63u) == 0 && IOSurfaceGetWidth(surface) * IOSurfaceGetHeight(surface) >= 1000000 && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;   // direct (zero-copy) only for display-size surfaces: worker-thread renders into smaller direct-attached textures left the surface empty (lock-screen clock 772x164, glyphs), while the same worker's renders into normal textures + GPU blit sync land fine (verified by readback); the render server's flips (828x1792) are the only proven-working direct case
+            if (g_direct && !inverted && att_seen(IOSurfaceGetID(surface)) >= 3 && osm_sweet_active() && IOSurfaceGetPixelFormat(surface) == 'BGRA' && (IOSurfaceGetBytesPerRow(surface) & 63u) == 0 && IOSurfaceGetWidth(surface) * IOSurfaceGetHeight(surface) >= 1000000 && osm_sweet_attach_direct(name, IOSurfaceGetID(surface))) direct = YES;   // direct (zero-copy) only for the present rotation (3+ re-attaches): GPU writes into direct-attached CONTENT surfaces never reached the surface memory (glyph-survival probes), so layers must keep private storage + a delivering sync; the render server's re-attached flips (828x1792) are the proven-working direct case
             // keep what the surface already shows: CoreAnimation redraws only the damaged part of a swap-chain buffer
             else if (IOSurfaceGetPixelFormat(surface) == 'BGRA') {
                 p->target_nowrap = YES;      // render-target attachment: the texture is drawn into, so it must not become a read-only in-place wrap of the surface
@@ -1330,7 +1406,7 @@ static DrawBind *find_bind(struct _EAGLContextPrivate *p, GLuint rb) {
         if (p->natt >= MAX_BIND) return NO;
         idx = p->natt++;
     } else { osm_sweet_forget(IOSurfaceGetID(p->att[idx].surf)); CFRelease(p->att[idx].surf); }
-    p->att[idx].name = name; p->att[idx].kind = kind; p->att[idx].surf = (IOSurfaceRef)CFRetain(surface); p->att[idx].inverted = inverted; p->att[idx].dirty = 1; p->att[idx].direct = direct;
+    p->att[idx].name = name; p->att[idx].kind = kind; p->att[idx].surf = (IOSurfaceRef)CFRetain(surface); p->att[idx].inverted = inverted; p->att[idx].dirty = 1; p->att[idx].direct = direct; p->att[idx].blit_ok = 0; p->att[idx].blit_tried = 0;
     // CoreAnimation attaches a NEW texture to the same display surface every frame; the earlier textures keep older pixels. Syncing them all wrote
     // those stale images over the surface in array order (the flicker, the black wallpaper): only the latest attachment of a surface is valid.
     for (int j = p->natt - 1; j >= 0; j--) {
