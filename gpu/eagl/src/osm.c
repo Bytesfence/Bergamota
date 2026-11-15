@@ -44,6 +44,7 @@ int osm_make_current(osm_ctx c, void *buf, int w, int h) {
     return OSMesaMakeCurrent((OSMesaContext)c, buf, GL_UNSIGNED_BYTE, w, h) ? 1 : 0;
 }
 void *osm_getproc(const char *name) { return (void *)OSMesaGetProcAddress(name); }
+void *osm_cur_ctx(void) { return (void *)OSMesaGetCurrentContext(); }
 
 extern int OSMesaSweetActive(void);
 extern int OSMesaSweetBlit(unsigned name, int is_texture, unsigned surface_id, int flip, int opaque);
