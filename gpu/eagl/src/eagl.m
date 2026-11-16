@@ -111,6 +111,20 @@ typedef struct {                    // attachImage:toCoreSurface:invertedRender:
     int direct;                     // the texture IS the surface memory (BGL_DIRECT): no blit, only finish + BO_SYNC
     int dirty;                      // drawn into (or newly attached) since the last sync: display-size attachments are copied only when dirty
     int blit_ok, blit_tried;        // GPU blit to this surface: verified delivering (blit_ok), attempted at least once (blit_tried)
+    // CA's damage-rect idiom (trace-verified on the lock screen): after compositing layer content into a present flip
+    // CA draws with NO program bound inside a small scissor rect - the region the compositor takes from this frame.
+    // The fullscreen scene/composite draws around it feed the next frame's texture chain, not the surface: on iOS the
+    // surface only ever receives the MARKED rects, never a full-frame copy of the final (text-buried) GL state.
+    int marker_ever;                // this attachment delivered damage markers once: permanently marker-driven
+    int nrects, rects_full;         // rects recorded since the last sync; rects_full = overflow (fall back to a full copy)
+    uint16_t rect[16][4];           // x, y, w, h (GL bottom-up space, clamped)
+    uint8_t *rectbuf[16];           // marker-time snapshots of rect[]: the text composites are in the texture AT THE
+                                    // MARKER (780-class flips mark after content); the fullscreen passes bury them
+                                    // later, so flush-time reads are digit-less (phone-proven wh=0, path S, mismatch 0)
+    uint16_t rwh[16];               // best white-pixel count seen in each rect (draw_watch_probe upgrades snapshots)
+    uint16_t rreg[16][4];           // the region each rectbuf[] snapshot actually covers (recorded rect, or the scissor window draw_watch_probe adopted)
+    uint16_t wrect[16][4]; int wcount;   // latched copy of the last marker rect set: survives the frame gap when markers
+                                        // fire AFTER the content draws (780-class) - draw_watch_probe keys off this
 } Attach;
 
 struct _EAGLSharegroupPrivate {
@@ -227,38 +241,92 @@ static BOOL mapping_writable(const void *p, size_t len) {
     return YES;
 }
 
+// Lock `s` and return a writable CPU base pointer (client-memory surfaces may need the kernel alias; NULL = not writable here).
+typedef struct { uint8_t *base; size_t bpr; BOOL via_alias; kern_return_t lk; } SurfPtr;
+static BOOL surface_write_ptr(IOSurfaceRef s, SurfPtr *q) {
+    q->via_alias = NO;
+    q->lk = IOSurfaceLock(s, 0, NULL);
+    q->base = q->lk == KERN_SUCCESS ? IOSurfaceGetBaseAddress(s) : NULL;
+    q->bpr = IOSurfaceGetBytesPerRow(s);
+    if (q->base && mapping_writable(q->base, q->bpr * IOSurfaceGetHeight(s))) return YES;
+    // read-only client memory (Control Center platters, live icons): the kernel gives a writable CPU alias of it (abi_minor 2)
+    // opt-in (BGL_ALIAS=1): read-only surfaces here are mostly the clients' own backing stores (text, labels);
+    // writing the render server's result into them doubled and smeared every label on the phone
+    void *ab = NULL; unsigned abpr = 0, aw = 0, ah = 0;
+    static int alias_on = -1;
+    if (alias_on < 0) { const char *e = getenv("BGL_ALIAS"); alias_on = e && e[0] == '1'; }
+    if (alias_on && osm_sweet_surface_alias(IOSurfaceGetID(s), &ab, &abpr, &aw, &ah)) { q->base = ab; q->bpr = abpr; q->via_alias = YES; return YES; }
+    if (q->lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+    q->base = NULL;
+    EAGL_DEBUG("CPU sync skipped: surface %u is not mapped writable here (no kernel alias)\n", IOSurfaceGetID(s));
+    return NO;
+}
+static void surface_write_release(IOSurfaceRef s, SurfPtr *q) {
+    if (!q->base) return;
+    if (q->via_alias) osm_sweet_alias_sync(IOSurfaceGetID(s));
+    if (q->lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+}
+
 static void rgba_to_surface(const uint8_t *src, uint32_t w, uint32_t h, IOSurfaceRef s, BOOL flip, BOOL opaque) {
-    kern_return_t lk = IOSurfaceLock(s, 0, NULL);
-    uint8_t *dst = lk == KERN_SUCCESS ? IOSurfaceGetBaseAddress(s) : NULL;
-    size_t bpr = IOSurfaceGetBytesPerRow(s);
-    BOOL via_alias = NO;
-    if (!dst || !mapping_writable(dst, bpr * IOSurfaceGetHeight(s))) {
-        // read-only client memory (Control Center platters, live icons): the kernel gives a writable CPU alias of it (abi_minor 2)
-        void *ab = NULL; unsigned abpr = 0, aw = 0, ah = 0;
-        // opt-in (BGL_ALIAS=1): read-only surfaces here are mostly the clients' own backing stores (text, labels);
-        // writing the render server's result into them doubled and smeared every label on the phone
-        static int alias_on = -1;
-        if (alias_on < 0) { const char *e = getenv("BGL_ALIAS"); alias_on = e && e[0] == '1'; }
-        if (alias_on && osm_sweet_surface_alias(IOSurfaceGetID(s), &ab, &abpr, &aw, &ah)) { dst = ab; bpr = abpr; via_alias = YES; }
-        else {
-            if (lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
-            EAGL_DEBUG("CPU sync skipped: surface %u is not mapped writable here (no kernel alias)\n", IOSurfaceGetID(s));
-            return;
-        }
-    }
+    SurfPtr q;
+    if (!surface_write_ptr(s, &q)) return;
     size_t sw = IOSurfaceGetWidth(s), sh = IOSurfaceGetHeight(s);
     uint32_t cw = w < sw ? w : (uint32_t)sw, ch = h < sh ? h : (uint32_t)sh;
     for (uint32_t y = 0; y < ch; y++) {
         const uint32_t *sp = (const uint32_t *)(src + (size_t)(flip ? (h - 1 - y) : y) * w * 4);
-        uint32_t *dp = (uint32_t *)(dst + y * bpr);
+        uint32_t *dp = (uint32_t *)(q.base + y * q.bpr);
         for (uint32_t x = 0; x < cw; x++) {
             uint32_t p = sp[x];                         // memory R G B A (little endian: 0xAABBGGRR)
             uint32_t r = p & 0xff, b = (p >> 16) & 0xff;
             dp[x] = (p & 0xff00ff00u) | (r << 16) | b | (opaque ? 0xff000000u : 0);
         }
     }
-    if (via_alias) osm_sweet_alias_sync(IOSurfaceGetID(s));
-    if (lk == KERN_SUCCESS) IOSurfaceUnlock(s, 0, NULL);
+    surface_write_release(s, &q);
+}
+
+// Damage-rect write: `src` is a glReadPixels(x0, y0, rw, rh) block (rows bottom-up, row stride rw*4). The row mapping
+// mirrors rgba_to_surface exactly (flip: surface row = total_h-1-gl_row), so a rect lands exactly where the full-frame
+// copy would have put it.
+static void rgba_to_surface_rect(const uint8_t *src, uint32_t rw, uint32_t rh, IOSurfaceRef s, uint32_t x0, uint32_t y0, BOOL flip, uint32_t total_h) {
+    SurfPtr q;
+    if (!surface_write_ptr(s, &q)) return;
+    uint32_t sw = (uint32_t)IOSurfaceGetWidth(s), sh = (uint32_t)IOSurfaceGetHeight(s);
+    if (x0 + rw > sw) rw = sw - x0;
+    if (y0 + rh > sh) rh = sh - y0;
+    uint32_t ybase = flip ? (total_h - y0 - rh) : y0;   // first surface row this rect writes
+    for (uint32_t y = 0; y < rh; y++) {
+        const uint32_t *sp = (const uint32_t *)(src + (size_t)(flip ? (rh - 1 - y) : y) * rw * 4);
+        uint32_t *dp = (uint32_t *)(q.base + (size_t)(ybase + y) * q.bpr + (size_t)x0 * 4);
+        for (uint32_t x = 0; x < rw; x++) {
+            uint32_t p = sp[x];                         // memory R G B A (little endian: 0xAABBGGRR)
+            uint32_t r = p & 0xff, b = (p >> 16) & 0xff;
+            dp[x] = (p & 0xff00ff00u) | (r << 16) | b;
+        }
+    }
+    surface_write_release(s, &q);
+}
+
+// Text-layer merge: same addressing as rgba_to_surface_rect, but only pixels with alpha > 8 are written - the
+// captured text layer is glyphs over transparency, so the delivered backdrop underneath survives and the
+// (tinted, never white - phone-proven) digits land on top of it.
+static void rgba_to_surface_rect_merge(const uint8_t *src, uint32_t rw, uint32_t rh, IOSurfaceRef s, uint32_t x0, uint32_t y0, BOOL flip, uint32_t total_h) {
+    SurfPtr q;
+    if (!surface_write_ptr(s, &q)) return;
+    uint32_t sw = (uint32_t)IOSurfaceGetWidth(s), sh = (uint32_t)IOSurfaceGetHeight(s);
+    if (x0 + rw > sw) rw = sw - x0;
+    if (y0 + rh > sh) rh = sh - y0;
+    uint32_t ybase = flip ? (total_h - y0 - rh) : y0;
+    for (uint32_t y = 0; y < rh; y++) {
+        const uint32_t *sp = (const uint32_t *)(src + (size_t)(flip ? (rh - 1 - y) : y) * rw * 4);
+        uint32_t *dp = (uint32_t *)(q.base + (size_t)(ybase + y) * q.bpr + (size_t)x0 * 4);
+        for (uint32_t x = 0; x < rw; x++) {
+            uint32_t p = sp[x];                         // memory R G B A (little endian: 0xAABBGGRR)
+            if (((p >> 24) & 0xff) <= 8) continue;      // transparent: keep the delivered backdrop
+            uint32_t r = p & 0xff, b = (p >> 16) & 0xff;
+            dp[x] = (p & 0xff00ff00u) | (r << 16) | b;
+        }
+    }
+    surface_write_release(s, &q);
 }
 
 // glTexImage2D(NULL): CA assumes the texture memory is cleared (iOS guarantees that); Mesa hands out recycled
@@ -448,6 +516,35 @@ static void fmtless_clean(IOSurfaceRef surf, int kind, uint32_t w, uint32_t h) {
     glActiveTexture((GLenum)sActive);
 }
 
+// Rect-limited readback of a texture level 0 (damage markers): one sub-rectangle, rows bottom-up, stride rw*4.
+// Same scratch-fbo discipline as read_image (GL_FRAMEBUFFER binding; detach after; restore alignment).
+static uint8_t *read_image_rect(EAGLContext *c, GLuint name, uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh, uint32_t hintw, uint32_t hinth) {
+    struct _EAGLContextPrivate *p = c->_private;
+    GLint oldRead = 0, oldPackAlign = 4;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldRead);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &oldPackAlign);
+    if (!p->tmpfbo) glGenFramebuffers(1, &p->tmpfbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, p->tmpfbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, name, 0);
+    uint8_t *buf = NULL;
+    if ((GLint)hintw > 0 && (GLint)hinth > 0 && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        if ((GLint)rx + (GLint)rw > (GLint)hintw) rw = (uint32_t)(((GLint)hintw - (GLint)rx > 0) ? ((GLint)hintw - (GLint)rx) : 0);
+        if ((GLint)ry + (GLint)rh > (GLint)hinth) rh = (uint32_t)(((GLint)hinth - (GLint)ry > 0) ? ((GLint)hinth - (GLint)ry) : 0);
+        if (rw && rh) {
+            buf = malloc((size_t)rw * rh * 4);
+            if (buf) {
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                glReadPixels((GLint)rx, (GLint)ry, (GLint)rw, (GLint)rh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+            }
+        }
+    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, oldRead);
+    glPixelStorei(GL_PACK_ALIGNMENT, oldPackAlign);
+    return buf;
+}
+
 // Read back the renderbuffer (or texture level 0) `name` of the current context into a malloc'ed RGBA buffer.
 static uint8_t *read_image(EAGLContext *c, GLuint name, BOOL isTexture, uint32_t hintw, uint32_t hinth, uint32_t *ow, uint32_t *oh) {
     struct _EAGLContextPrivate *p = c->_private;
@@ -574,6 +671,7 @@ static void frame_stats(Attach *a, double t_start, double t_end, int gpu) {
 // submit), blit = enqueue / render-wait (GPU time of the client's drawing, forced by a finish) / copy-wait (GPU time of the blit) / BO_SYNC,
 // cpu = surfaces copied through the CPU (read_image + rgba_to_surface). In this mode the extra finish makes frames slower than they are normally.
 static unsigned g_mark_hit, g_mark_miss, g_draw_seen;
+static unsigned g_marker_rec_n, g_marker_del_n;   // damage-marker log caps (recorder in the draw hooks, delivery in sync_att)
 static double g_ps_direct_ms; static int g_ps_direct_n;
 static double g_ps_flush_ms, g_ps_cpu_ms; static int g_ps_cpu_n, g_ps_syncs, g_ps_skipped;
 static void pipe_stats_report(void) {
@@ -620,15 +718,121 @@ static void (*mesa_glFlush)(void), (*mesa_glFinish)(void);   // tentative: defin
 
 static void glyph_survival_check(IOSurfaceRef surf, int direct);   // defined with the flip probes: did the glyph draw's pixels land in surface memory at sync?
 static int g_gpu_blit(void) { static int v = -1; if (v < 0) v = getenv("BGL_GPU_BLIT") != NULL; return v; }   // default OFF: the blit can silently write nothing
+static int g_damage_en(void);   // defined with the marker recorder below
+// ---- clock-rect latch, atlas registry, text-layer capture (used by sync_att's merge and the draw hooks) ----
+static uint16_t g_clock_rect[4] = {0, 0, 0, 0}; static int g_clock_valid;   // largest marker rect seen (the clock zone)
+static struct { GLuint name; uint32_t w, h; int kind; int probed; } g_atlas[128]; static int g_natlas;
+static pthread_mutex_t g_atlas_lock = PTHREAD_MUTEX_INITIALIZER;
+static void atlas_track(GLuint name, uint32_t w, uint32_t h, int kind) {
+    if (!name) return;
+    pthread_mutex_lock(&g_atlas_lock);
+    int hit = 0;
+    for (int i = 0; i < g_natlas; i++) if (g_atlas[i].name == name) { g_atlas[i].w = w; g_atlas[i].h = h; g_atlas[i].kind = kind; hit = 1; break; }
+    if (!hit && g_natlas < 128) { g_atlas[g_natlas].name = name; g_atlas[g_natlas].w = w; g_atlas[g_natlas].h = h; g_atlas[g_natlas].kind = kind; g_atlas[g_natlas].probed = 0; g_natlas++; }
+    pthread_mutex_unlock(&g_atlas_lock);
+}
+// Text-layer capture: the glyph atlases are ALIVE at composite time (phone-proven: 'A8 416x258: a 24379/107328 px')
+// and the atlas draws render the digits into cache fbos - but the digits are TINTED (wallpaper-adaptive), never
+// white, and the fullscreen passes bury them before every flush read. Captured after each atlas-sampling draw and
+// alpha-merged over the delivered frame, they survive the bury.
+static uint8_t *g_text_buf[4]; static uint16_t g_text_reg[4][4]; static uint64_t g_text_seq[4]; static int g_text_n;
+static void text_layer_capture(EAGLContext *c) {
+    GLint act0 = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act0);
+    glActiveTexture(GL_TEXTURE0);
+    GLint tex0 = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+    glActiveTexture((GLenum)act0);
+    pthread_mutex_lock(&g_atlas_lock);
+    int is_atlas = 0;
+    for (int i = 0; i < g_natlas; i++) if (g_atlas[i].name == (GLuint)tex0) { is_atlas = 1; break; }
+    pthread_mutex_unlock(&g_atlas_lock);
+    if (!is_atlas || !g_clock_valid) return;
+    int32_t x = g_clock_rect[0], y = g_clock_rect[1], w = g_clock_rect[2], h = g_clock_rect[3];
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (w <= 0 || h <= 0) return;
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);                    // the bound target must actually contain the region:
+    if (vp[2] < x + w || vp[3] < y + h) return;        // an atlas-sized cache target reads out of bounds = garbage (the pixel mess)
+    GLint rb = 0, pa = 4;
+    glGetIntegerv(GL_READ_BUFFER, &rb); glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
+    glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    uint8_t *b = malloc((size_t)w * h * 4);
+    GLenum rerr = GL_NO_ERROR;
+    if (b) { glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); rerr = glGetError(); }
+    glReadBuffer((GLenum)rb); glPixelStorei(GL_PACK_ALIGNMENT, pa);
+    if (!b || rerr != GL_NO_ERROR) { free(b); while (glGetError() != GL_NO_ERROR) {} return; }   // failed read = undefined buffer
+    size_t nz = 0, nzrgb = 0;
+    for (size_t q = 0; q < (size_t)w * h; q++) {
+        const uint8_t *px = b + q * 4;
+        if (px[0] | px[1] | px[2] | px[3]) { nz++; if (px[0] | px[1] | px[2]) nzrgb++; }
+    }
+    if (nz < 200) { free(b); return; }        // never store an empty layer (the atlas draws fire before AND after the region fills)
+    if (nzrgb * 4 < nz) { free(b); return; }  // mask stage (alpha-only, rgb=0): merging it writes BLACK digit shapes - wait for the tinted stage
+    int slot = -1;
+    for (int i = 0; i < g_text_n; i++) if (g_text_reg[i][0] == (uint16_t)x && g_text_reg[i][1] == (uint16_t)y && g_text_reg[i][2] == (uint16_t)w && g_text_reg[i][3] == (uint16_t)h) { slot = i; break; }
+    if (slot < 0 && g_text_n < 4) slot = g_text_n++;
+    if (slot < 0) slot = 0;      // round-robin the last
+    static size_t g_text_nz[4]; static double g_text_time[4];
+    double nowT = now_ms();
+    if (g_text_buf[slot] && g_text_nz[slot] > 0 && nz * 2 < g_text_nz[slot] && nowT - g_text_time[slot] < 1000.0) {
+        free(b);                 // a much emptier read seconds after a full one: keep the good capture
+        return;
+    }
+    free(g_text_buf[slot]);
+    g_text_buf[slot] = b; g_text_reg[slot][0] = x; g_text_reg[slot][1] = y; g_text_reg[slot][2] = w; g_text_reg[slot][3] = h; g_text_seq[slot]++;
+    g_text_nz[slot] = nz; g_text_time[slot] = nowT;
+    static unsigned nc; if (g_debug && nc++ < 200) EAGL_DEBUG("textlayer: captured %d,%d %dx%d nz %zu (slot %d)\n", x, y, w, h, nz, slot);
+}
+static int damage_watch(void) {          // /private/var/tmp/bgl-watch arms a 30 s uncapped logging window; a fresh touch re-arms
+    static time_t t0 = (time_t)0 - 60;  // "long expired" so the boot's own touch arms the first window
+    time_t now = time(NULL);
+    if (now - t0 >= 30 && access("/private/var/tmp/bgl-watch", F_OK) == 0) {
+        t0 = now; unlink("/private/var/tmp/bgl-watch"); EAGL_DEBUG("damage-watch: 30 s uncapped logging window armed\n");
+    }
+    return now - t0 < 30;
+}
+// Re-write the marker-time snapshots over the (already delivered) full frame and free them. `full` = the
+// flush-time full-frame read, for the wh comparison (marker-time near-white pixels vs flush-time ones in the
+// same regions - the digits); may be NULL (direct/blit paths, failed read).
+static void damage_rect_flush(Attach *a, const uint8_t *full, uint32_t fw, uint32_t fh) {
+    if (!a->nrects && !a->rects_full) return;
+    BOOL flip = a->kind ? a->inverted : !a->inverted;
+    size_t mwh = 0, fwh = 0, mnz = 0;
+    for (int r = 0; r < a->nrects; r++) {
+        uint32_t rx = a->rreg[r][0], ry = a->rreg[r][1], rw = a->rreg[r][2], rh = a->rreg[r][3];
+        uint8_t *b = a->rectbuf[r];
+        if (!b) continue;
+        BOOL ok = full && rx + rw <= fw && ry + rh <= fh;
+        for (uint32_t j = 0; j < rh; j++) {
+            const uint8_t *mrow = b + (size_t)j * rw * 4;
+            const uint8_t *frow = ok ? full + ((size_t)(ry + j) * fw + rx) * 4 : NULL;
+            for (uint32_t k = 0; k < rw; k++) {
+                const uint8_t *m = mrow + k * 4;
+                if (m[0]) { mnz++; if (m[0] > 200 && m[1] > 200 && m[2] > 200) mwh++; }
+                if (frow) { const uint8_t *f = frow + k * 4; if (f[0] > 200 && f[1] > 200 && f[2] > 200) fwh++; }
+            }
+        }
+        rgba_to_surface_rect(b, rw, rh, a->surf, rx, ry, flip, (uint32_t)IOSurfaceGetHeight(a->surf));
+        free(b); a->rectbuf[r] = NULL;
+    }
+    if (a->nrects && g_debug && (damage_watch() || g_marker_del_n++ < 400))
+        EAGL_DEBUG("damage-rect surface %u: %d rects (%u,%u %ux%u), marker wh %zu nz %zu, flush wh %zu\n",
+                   IOSurfaceGetID(a->surf), a->nrects, a->rect[0][0], a->rect[0][1], a->rect[0][2], a->rect[0][3], mwh, mnz, fwh);
+    a->nrects = 0; a->rects_full = 0;
+    for (int r = 0; r < 16; r++) if (a->rectbuf[r]) { free(a->rectbuf[r]); a->rectbuf[r] = NULL; }   // overflow leftovers
+}
 static void sync_att(EAGLContext *c, int i) {
     struct _EAGLContextPrivate *p = c->_private;
     Attach *a = &p->att[i];
         a->dirty = 0;
+        // Damage-rect delivery: the MARKER-TIME snapshots captured in damage_marker_record (a->rectbuf[]) are
+        // re-written over the full frame by damage_rect_flush at the end of this sync - last write wins. There
+        // are no flush-time rect reads: the flush state is post-bury and digit-less on every read path.
         if (a->direct) {
             double td = g_debug ? now_ms() : 0; osm_sweet_direct_sync(IOSurfaceGetID(a->surf)); if (g_debug) { g_ps_direct_ms += now_ms() - td; g_ps_direct_n++; }
             { static unsigned nd; if (g_debug && nd++ < 4000) EAGL_DEBUG("direct_sync surface %u (dirty flush)\n", IOSurfaceGetID(a->surf)); }
             if (g_debug_frames) verify_direct(c, a);
             glyph_survival_check(a->surf, 1);
+            damage_rect_flush(a, NULL, 0, 0);
             return;
         }
         mesa_glFinish();   // glFlush only SUBMITTED the batch (the clock's digits read back as all-zero for exactly this reason: the GPU was still rendering when the sync copied the texture)
@@ -644,6 +848,7 @@ static void sync_att(EAGLContext *c, int i) {
             { static unsigned nb; if (g_debug && nb++ < 400) EAGL_DEBUG("blit-sync surface %u tex %u ok\n", IOSurfaceGetID(a->surf), a->name); }
             glyph_survival_check(a->surf, 0);
             if (g_debug) { frame_stats(a, t_start, now_ms(), 1); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), YES); }
+            damage_rect_flush(a, NULL, 0, 0);
             return;
         }
         uint32_t w, h;
@@ -672,11 +877,26 @@ static void sync_att(EAGLContext *c, int i) {
         }
         if (!buf) buf = read_image(c, a->name, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), &w, &h);
         if (buf) {
-            if (g_debug) { static unsigned nq; if (nq++ < 400) { size_t tot = (size_t)w * h * 4, nz = 0; size_t y0 = 0, y1 = 0; for (size_t y = 0; y < h; y++) { size_t rn = 0; for (size_t x = 0; x < w * 4; x++) if (buf[y * w * 4 + x]) rn++; if (rn) { nz += rn; if (!y0) y0 = y; y1 = y; } } EAGL_DEBUG("cpu-sync surface %u: GL image %ux%u, %zu of %zu bytes non-zero, rows %zu-%zu\n", IOSurfaceGetID(a->surf), w, h, nz, tot, y0, y1); } }
+            if (g_debug) { static unsigned nq; if (nq++ < 400 || damage_watch()) { size_t tot = (size_t)w * h * 4, nz = 0; size_t y0 = 0, y1 = 0; for (size_t y = 0; y < h; y++) { size_t rn = 0; for (size_t x = 0; x < w * 4; x++) if (buf[y * w * 4 + x]) rn++; if (rn) { nz += rn; if (!y0) y0 = y; y1 = y; } } EAGL_DEBUG("cpu-sync surface %u: GL image %ux%u, %zu of %zu bytes non-zero, rows %zu-%zu\n", IOSurfaceGetID(a->surf), w, h, nz, tot, y0, y1); } }
             // GL rows are bottom-up; a "normal" surface is top-down. invertedRender means CA already drew it flipped.
             rgba_to_surface(buf, w, h, a->surf, flip, NO);
+            // The marker-time snapshots (blur-era, no digits - the scratch storage never held them).
+            damage_rect_flush(a, buf, w, h);
+            // Text-layer merge LAST (the clock fix): the digits render mid-frame from the glyph atlases (tinted,
+            // alive, phone-proven) into cache targets and get buried by the fullscreen passes before this flush
+            // read. Alpha-merge every captured text layer over everything else - glyphs land, backdrop survives.
+            // (Order matters: an earlier build merged BEFORE the rect flush and the blur snapshot erased the digits.)
+            if (a->marker_ever) {
+                size_t merged = 0;
+                for (int t = 0; t < g_text_n; t++) if (g_text_buf[t]) {
+                    // count first (cap-limited log), then merge
+                    for (size_t q = 0; q < (size_t)g_text_reg[t][2] * g_text_reg[t][3]; q++) if (((const uint32_t *)g_text_buf[t])[q] >> 24 > 8) merged++;
+                    rgba_to_surface_rect_merge(g_text_buf[t], g_text_reg[t][2], g_text_reg[t][3], a->surf, g_text_reg[t][0], g_text_reg[t][1], flip, h);
+                }
+                { static unsigned nm; if (g_debug && merged && nm++ < 100) EAGL_DEBUG("textmerge surf %u: %d slots, %zu px\n", IOSurfaceGetID(a->surf), g_text_n, merged); }
+            }
             free(buf);
-        }
+        } else damage_rect_flush(a, NULL, 0, 0);
         if (g_debug) { g_ps_cpu_ms += now_ms() - t_cpu0; g_ps_cpu_n++; }
         if (g_debug) { frame_stats(a, t_start, now_ms(), 0); maybe_dump(c, i, isTex, (uint32_t)IOSurfaceGetWidth(a->surf), (uint32_t)IOSurfaceGetHeight(a->surf), NO); }
 }
@@ -692,7 +912,7 @@ static void sync_attached(EAGLContext *c) {
     }
     for (int i = 0; i < p->natt; i++) {
         Attach *a = &p->att[i];
-        if (g_dirty_track && !force_all && !a->dirty && IOSurfaceGetWidth(a->surf) * IOSurfaceGetHeight(a->surf) >= 1000000) { g_ps_skipped++; continue; }   // display buffer nobody drew into
+        if (g_dirty_track && !force_all && !a->dirty) { g_ps_skipped++; continue; }   // nobody drew into it this flush: no GL state changed since the last sync. All sizes - the old >=1M px exemption rewrote every small att (icons) from its GL texture on EVERY flush
         sync_att(c, i);
     }
 }
@@ -702,7 +922,7 @@ static void (*mesa_glFlush)(void), (*mesa_glFinish)(void);
 static void pipe_count_sync(EAGLContext *c) {
     if (!g_debug || !c->_private->natt) return;
     size_t w = 0, h = 0; for (int i = 0; i < c->_private->natt; i++) { size_t aw = IOSurfaceGetWidth(c->_private->att[i].surf); if (aw > w) { w = aw; h = IOSurfaceGetHeight(c->_private->att[i].surf); } }
-    if (w >= 1000 && h >= 2000 && ++g_ps_syncs % 60 == 0) pipe_stats_report();
+    if (w >= 800 && h >= 1700 && ++g_ps_syncs % 60 == 0) pipe_stats_report();   // 828x1792 presents (the old >=1000x2000 gate never fired on this panel)
 }
 static void shim_glFlush(void) {
     // Wrapped client-memory surfaces: the seed check at bind time misses producer writes while a texture stays
@@ -934,6 +1154,8 @@ static void feedback_fix_end(void) {
 // appears (over a broken backdrop), display = flip and the scene import is the delivery path that loses the
 // GL-origin content. Gated past boot splash (draw #3000+).
 static long g_draw_total; static int g_nocover = -1;
+static int g_damage_en(void) { static int v = -1; if (v < 0) v = getenv("BGL_NODAMAGE") == NULL; return v; }   // BGL_NODAMAGE=1: back to full-frame flush syncs
+static int g_probes(void) { static int v = -1; if (v < 0) v = getenv("BGL_PROBES") != NULL; return v; }        // heavy per-draw probes (draw_probe/flip-delta): off by default, they cost a glFinish per draw
 static int cover_skip(void) {
     if (g_nocover < 0) g_nocover = (access("/private/var/tmp/bgl-nocover", F_OK) == 0);
     if (!g_nocover || g_draw_total < 300) return 0;   // past boot splash (~#154), before first cover (~#519)
@@ -949,8 +1171,140 @@ static int cover_skip(void) {
     if (hit) { static unsigned ns; if (ns++ < 30) EAGL_DEBUG("cover-skip: draw of imported scene tex %u skipped (nocover)\n", (unsigned)t); }
     return hit;
 }
-static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); g_draw_total++; if (cover_skip()) return; mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawArrays(a, b, c); feedback_fix_end(); if (g_debug) draw_probe("arrays", c); flip_delta_end("arrays", c); }
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); g_draw_total++; if (cover_skip()) return; mark_cur_dirty(); flip_delta_begin(); feedback_fix_begin(); o_DrawElements(a, b, c, d); feedback_fix_end(); if (g_debug) draw_probe("elements", b); flip_delta_end("elements", b); }
+// CA's damage idiom, recorder half (the delivery half is in sync_att): a draw with NO program bound, scissor test on,
+// inside a rect well below full-screen, into an attached flip. The draw itself is invalid GL (no program) - Mesa drops
+// it - CA uses it as a bookkeeping marker. Record the rect; the flush delivers exactly these rects to the surface.
+// Unscissored prog-0 draws (the attach-time touch, the flush no-ops) and fullscreen-scissored ones are NOT markers.
+static void damage_marker_record(EAGLContext *c) {
+    struct _EAGLContextPrivate *p = c->_private;
+    GLint prog = 0, sc = 0, box[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    if (prog) return;
+    glGetIntegerv(GL_SCISSOR_TEST, &sc);
+    if (!sc) return;
+    glGetIntegerv(GL_SCISSOR_BOX, box);
+    Attach *a = &p->att[p->cur_att];
+    uint32_t sw = (uint32_t)IOSurfaceGetWidth(a->surf), sh = (uint32_t)IOSurfaceGetHeight(a->surf);
+    int32_t x = box[0], y = box[1], w = box[2], h = box[3];
+    if (x < 0) { w += x; x = 0; }                   // CA's fullscreen rects come with a negative origin
+    if (y < 0) { h += y; y = 0; }
+    if (w <= 0 || h <= 0) return;
+    if ((uint32_t)w >= (sw * 9) / 10 && (uint32_t)h >= (sh * 9) / 10) return;   // fullscreen bookkeeping
+    if ((uint32_t)x >= sw || (uint32_t)y >= sh || !w || !h) return;
+    if (x + w > (int32_t)sw) w = (int32_t)sw - x;
+    if (y + h > (int32_t)sh) h = (int32_t)sh - y;
+    if (!a->marker_ever) { a->marker_ever = 1; if (g_debug) EAGL_DEBUG("damage-marker: surface %u carries damage markers (rect %d,%d %ux%u)\n", IOSurfaceGetID(a->surf), x, y, (unsigned)w, (unsigned)h); }
+    if (a->nrects < 16) {
+        a->rect[a->nrects][0] = (uint16_t)x; a->rect[a->nrects][1] = (uint16_t)y; a->rect[a->nrects][2] = (uint16_t)w; a->rect[a->nrects][3] = (uint16_t)h;
+        // Capture NOW, deliver NOW. This is the only moment the marked region holds its text: the markers that
+        // fire after their content draws (780-class flips) bracket the text composites, and the fullscreen
+        // scene/composite passes later in the frame bury it - every read at flush time (scratch AND bound-fb)
+        // came back digit-less. The snapshot is kept: damage_rect_flush re-writes it over the full frame at sync
+        // (last write wins) and the attach-time BO->texture CPU copy seeds the next frame with it - the same
+        // persistence loop that made the rect-only build's clock visible, now on top of the full-frame base.
+        BOOL rtex = a->kind ? (a->kind == 1) : (glIsTexture(a->name) && !glIsRenderbuffer(a->name));
+        uint8_t *b = rtex ? read_image_rect(c, a->name, x, y, w, h, sw, sh) : NULL;
+        if (b) {
+            free(a->rectbuf[a->nrects]);
+            a->rectbuf[a->nrects] = b;          // owned here until damage_rect_flush (or a better snapshot replaces it)
+            a->rwh[a->nrects] = 0;              // white-pixel count so far: draw_watch_probe replaces the snapshot when a post-draw read beats it
+            a->rreg[a->nrects][0] = (uint16_t)x; a->rreg[a->nrects][1] = (uint16_t)y; a->rreg[a->nrects][2] = (uint16_t)w; a->rreg[a->nrects][3] = (uint16_t)h;
+        }
+        a->nrects++;
+        memcpy(a->wrect, a->rect, sizeof a->wrect); a->wcount = a->nrects;   // refresh the latch for draw_watch_probe
+        if ((int)w * h > (int)g_clock_rect[2] * g_clock_rect[3]) { g_clock_rect[0] = (uint16_t)x; g_clock_rect[1] = (uint16_t)y; g_clock_rect[2] = (uint16_t)w; g_clock_rect[3] = (uint16_t)h; g_clock_valid = 1; }
+    }
+    else a->rects_full = 1;
+    // no a->dirty here: markers fire into BOTH flips every frame; dirtying them full-frame-synced the undrawn
+    // flip as well (2x 5.9 MB per flush = the fps regression) and dragged marker'd small atts into every sync.
+    if (g_debug && g_marker_rec_n++ < 400) EAGL_DEBUG("damage-marker surface %u rect %d,%d %ux%u (pending %d)\n", IOSurfaceGetID(a->surf), x, y, (unsigned)w, (unsigned)h, a->nrects);
+}
+
+// Watch-window post-draw probe (diagnostic + capture-on-improvement). For real draws into marker surfaces, read
+// the scissor region from the BOUND fbo right after the draw - the only read that sees the fbo's render storage
+// mid-frame (scratch re-attach reads can differ on fd630). If the read shows MORE near-white pixels (digit strokes)
+// than the best snapshot of an intersecting rect, the read BECOMES that rect's snapshot and is written to the BO
+// immediately: whatever erases the digits later in the frame no longer matters. Draws that render nothing log a
+// state fingerprint (stencil/colormask suspects) once per unique (program, state) combination.
+// ---- (atlas registry + text-layer capture live above sync_att; draw_watch_probe below) ----
+static void draw_watch_probe(void) {
+    if (!damage_watch()) return;
+    EAGLContext *c = cur_ctx(); if (!c) return;
+    struct _EAGLContextPrivate *p = c->_private;
+    GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    if (!prog) return;                                     // the marker draws themselves
+    if (!g_clock_valid) return;
+    // dedupe: the first occurrence of each (target texture, program, sampled texture) says everything the
+    // repeats would; bounded probe cost regardless of draw rate
+    GLint fb = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+    GLint act0 = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act0);
+    glActiveTexture(GL_TEXTURE0);
+    GLint tex0 = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+    glActiveTexture((GLenum)act0);
+    static struct { GLuint fb, prog, tex; unsigned n; } seen[128]; static int nseen;
+    int hit = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i].fb == (GLuint)fb && seen[i].prog == (GLuint)prog && seen[i].tex == (GLuint)tex0) { seen[i].n++; hit = 1; break; }
+    if (hit) return;
+    if (nseen < 128) { seen[nseen].fb = (GLuint)fb; seen[nseen].prog = (GLuint)prog; seen[nseen].tex = (GLuint)tex0; seen[nseen].n = 1; nseen++; }
+    // atlas readback: is the sampled text source still alive?
+    char atlasinfo[192] = "";
+    {
+        pthread_mutex_lock(&g_atlas_lock);
+        for (int i = 0; i < g_natlas; i++) if (g_atlas[i].name == (GLuint)tex0 && !g_atlas[i].probed) {
+            g_atlas[i].probed = 1;
+            uint32_t rw = 0, rh = 0;
+            uint8_t *ab = read_image(c, g_atlas[i].name, YES, g_atlas[i].w, g_atlas[i].h, &rw, &rh);
+            if (ab) {
+                size_t anz = 0, argb = 0, tot = (size_t)rw * rh;
+                for (size_t q = 0; q < tot; q++) { const uint8_t *px = ab + q * 4; if (px[3]) anz++; if (px[0] | px[1] | px[2]) argb++; }
+                snprintf(atlasinfo, sizeof atlasinfo, " | ATLAS tex %u (%s %ux%u): rgb %zu a %zu of %zu px", g_atlas[i].name, g_atlas[i].kind == 1 ? "A8" : g_atlas[i].kind == 2 ? "L8" : "LA8", rw, rh, argb, anz, tot);
+                free(ab);
+            } else snprintf(atlasinfo, sizeof atlasinfo, " | ATLAS tex %u: read failed (not renderable)", g_atlas[i].name);
+            break;
+        }
+        pthread_mutex_unlock(&g_atlas_lock);
+    }
+    // clock-rect read from the bound fbo (scissor-agnostic: the marshal path toggles scissor invisibly)
+    {
+        Attach *a = p->cur_att >= 0 ? &p->att[p->cur_att] : NULL;
+        int32_t x = g_clock_rect[0], y = g_clock_rect[1], w = g_clock_rect[2], h = g_clock_rect[3];
+        uint32_t sw = a ? (uint32_t)IOSurfaceGetWidth(a->surf) : 828, shh = a ? (uint32_t)IOSurfaceGetHeight(a->surf) : 1792;
+        if (x < 0) x = 0; if (y < 0) y = 0;
+        if (x + w > (int32_t)sw) w = (int32_t)sw - x;
+        if (y + h > (int32_t)shh) h = (int32_t)shh - y;
+        if (w <= 0 || h <= 0) return;
+        GLint rb = 0, pa = 4;
+        glGetIntegerv(GL_READ_BUFFER, &rb); glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
+        glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        uint8_t *b = malloc((size_t)w * h * 4);
+        if (b) glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b);
+        glReadBuffer((GLenum)rb); glPixelStorei(GL_PACK_ALIGNMENT, pa);
+        if (!b) return;
+        size_t nz = 0, wh = 0;
+        for (size_t q = 0; q < (size_t)w * h; q++) {
+            const uint8_t *px = b + q * 4;
+            if (px[0] | px[1] | px[2] | px[3]) { nz++; if (px[0] > 200 && px[1] > 200 && px[2] > 200) wh++; }
+        }
+        EAGL_DEBUG("dw2 %s fbo %u prog %u tex %u: clockrect %d,%d %dx%d nz %zu wh %zu%s\n",
+                   a ? "att" : "cache", (unsigned)fb, (unsigned)prog, (unsigned)tex0, x, y, w, h, nz, wh, atlasinfo);
+        if (a && a->marker_ever && a->nrects > 0 && wh > 0) {     // adopt only on real white content in a marker att
+            int r = 0;
+            if (wh > (size_t)a->rwh[r] + 200) {
+                a->rwh[r] = (uint16_t)(wh > 65535 ? 65535 : wh);
+                free(a->rectbuf[r]);
+                a->rectbuf[r] = b;
+                a->rreg[r][0] = (uint16_t)x; a->rreg[r][1] = (uint16_t)y; a->rreg[r][2] = (uint16_t)w; a->rreg[r][3] = (uint16_t)h;
+                rgba_to_surface_rect(b, w, h, a->surf, x, y, a->kind ? a->inverted : !a->inverted, shh);
+                EAGL_DEBUG("dw2 ADOPT surf %u: clockrect wh %zu\n", IOSurfaceGetID(a->surf), wh);
+                return;
+            }
+        }
+        free(b);
+    }
+}
+
+static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); o_DrawArrays(a, b, c); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_capture(m); } draw_watch_probe(); if (g_probes()) { draw_probe("arrays", c); flip_delta_end("arrays", c); }}
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); o_DrawElements(a, b, c, d); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_capture(m); } draw_watch_probe(); if (g_probes()) { draw_probe("elements", b); flip_delta_end("elements", b); }}
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { ctxless_warn("glDrawArraysInstanced"); mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
@@ -1079,6 +1433,7 @@ static void h_DeleteTextures(GLsizei n, const GLuint *t) {
         if (a->kind == 2 || !att_is_tex(a)) continue;
         BOOL big = IOSurfaceGetWidth(a->surf) * IOSurfaceGetHeight(a->surf) >= 1000000;
         if (g_dirty_track && a->dirty && big) sync_att(c, k);
+        for (int r = 0; r < 16; r++) if (a->rectbuf[r]) { free(a->rectbuf[r]); a->rectbuf[r] = NULL; }   // marker-time snapshots
         // The texture is going away: its attachment must too. A stale entry kept copying a deleted (empty) texture over a live display surface
         // every flush (surface black after CoreAnimation tore down its buffers: display sleep/wake, app switches).
         osm_sweet_forget(IOSurfaceGetID(a->surf)); CFRelease(a->surf);
@@ -1215,6 +1570,7 @@ static void eagl_install_hooks(void) {
     if (p) {
         if (cur_ctx() == self) [EAGLContext setCurrentContext:nil];
         ctxreg_remove(p->osm);
+        for (int i = 0; i < p->natt; i++) for (int r = 0; r < 16; r++) if (p->att[i].rectbuf[r]) { free(p->att[i].rectbuf[r]); p->att[i].rectbuf[r] = NULL; }   // marker-time snapshots
         for (int i = 0; i < p->nbinds; i++) {
             [p->binds[i].drawable release];
             for (int k = 0; k < POOL_N; k++) if (p->binds[i].pool[k]) { osm_sweet_forget(IOSurfaceGetID(p->binds[i].pool[k])); CFRelease(p->binds[i].pool[k]); }
@@ -1566,7 +1922,7 @@ static EAGLContext *upctx_for(EAGLContext *target) {
         if (fmt_copy) fmtless_clean(ioSurface, kind, w, h);      // the SBO clean of the throwaway import makes the CPU read below fresh
     }
     // Zero-copy sampling (opt-in): kind of the GL upload that the GPU can sample straight from the surface memory (A8, L8, LA8, RGBA8, BGRA8, RGBA16F)
-    if (!fmt_copy && g_wrapsample && !g_nowrap && !g_reupload && !self->_private->target_nowrap && (GLenum)target == GL_TEXTURE_2D && !planar && osm_sweet_active()) {
+    if (!fmt_copy && g_wrapsample && !g_nowrap && !g_reupload && !self->_private->target_nowrap && (GLenum)target == GL_TEXTURE_2D && !planar && (kind < 1 || kind > 3) && osm_sweet_active()) {   // kinds 1-3 (A8/L8/LA8): always the CPU copy - the RGBA8 expansion below is the text fix
         GLint wb = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &wb);
         if (kind && wb && osm_sweet_wrap_texture((unsigned)wb, IOSurfaceGetID(ioSurface), kind, w, h)) {
             pthread_mutex_lock(&g_live_lock);
@@ -1613,9 +1969,27 @@ static EAGLContext *upctx_for(EAGLContext *target) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     GLenum ifmt = internalFormat == GL_BGRA_EXT ? GL_RGBA : (GLenum)internalFormat;
-    if (g_reupload) glTexSubImage2D((GLenum)target, 0, 0, 0, w, h, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
-    else glTexImage2D((GLenum)target, 0, ifmt, w, h, 0, bgra8 ? GL_RGBA : (GLenum)format, (GLenum)type, tmp);
+    GLenum ufmt = bgra8 ? GL_RGBA : (GLenum)format;
+    if (kind >= 1 && kind <= 3 && type == 0x1401 && !bgra8 && getenv("BGL_NOA8FIX") == NULL) {
+        // freedreno's alpha/luminance-only texture emulation is a text-killer (glyph masks sample empty: every
+        // text composite blends SRC_ALPHA=0 = no-op). Upload kinds 1/2/3 as RGBA8 with bit-identical sampling
+        // semantics: ALPHA -> (0,0,0,A), LUMINANCE -> (L,L,L,1), LUMINANCE_ALPHA -> (L,L,L,A).
+        uint8_t *x = malloc((size_t)w * h * 4);
+        if (x) {
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                if (kind == 1) { uint8_t s = tmp[i]; x[i*4] = 0; x[i*4+1] = 0; x[i*4+2] = 0; x[i*4+3] = s; }
+                else if (kind == 2) { uint8_t s = tmp[i]; x[i*4] = s; x[i*4+1] = s; x[i*4+2] = s; x[i*4+3] = 255; }
+                else { uint8_t l = tmp[i*2], al = tmp[i*2+1]; x[i*4] = l; x[i*4+1] = l; x[i*4+2] = l; x[i*4+3] = al; }
+            }
+            free(tmp); tmp = x;
+            ifmt = GL_RGBA8; ufmt = GL_RGBA;
+            { static unsigned na; if (g_debug && na++ < 400) EAGL_DEBUG("a8fix: surface %u kind %d %ux%u expanded to RGBA8 for upload\n", IOSurfaceGetID(ioSurface), kind, w, h); }
+        }
+    }
+    if (g_reupload) glTexSubImage2D((GLenum)target, 0, 0, 0, w, h, ufmt, (GLenum)type, tmp);
+    else glTexImage2D((GLenum)target, 0, ifmt, w, h, 0, ufmt, (GLenum)type, tmp);
     GLenum err = glGetError();
+    if (kind >= 1 && kind <= 3) { GLint at_ = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &at_); atlas_track((GLuint)at_, w, h, kind); }   // register the text source for draw_watch_probe
     if (err != GL_NO_ERROR) {
         GLint imm = -1, pbo = -1;
         glGetTexParameteriv((GLenum)target, 0x912f /* GL_TEXTURE_IMMUTABLE_FORMAT */, &imm);
