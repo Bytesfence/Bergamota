@@ -721,6 +721,14 @@ static int g_gpu_blit(void) { static int v = -1; if (v < 0) v = getenv("BGL_GPU_
 static int g_damage_en(void);   // defined with the marker recorder below
 // ---- clock-rect latch, atlas registry, text-layer capture (used by sync_att's merge and the draw hooks) ----
 static uint16_t g_clock_rect[4] = {0, 0, 0, 0}; static int g_clock_valid;   // largest marker rect seen (the clock zone)
+static uint16_t g_mrects[8][4]; static int g_mrect_n;                      // ALL unique marker rects (clock + line + ...): the snap reads each
+static void mrect_latch(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (g_clock_valid && (int)w * h <= (int)g_clock_rect[2] * g_clock_rect[3] * 2 / 3) {
+        // much smaller than the clock zone: a separate region (the line) - latch it too
+    } else if (g_clock_valid && (int)w * h * 3 < (int)g_clock_rect[2] * g_clock_rect[3]) return;
+    for (int i = 0; i < g_mrect_n; i++) if (g_mrects[i][0] == (uint16_t)x && g_mrects[i][1] == (uint16_t)y && g_mrects[i][2] == (uint16_t)w && g_mrects[i][3] == (uint16_t)h) return;
+    if (g_mrect_n < 8) { g_mrects[g_mrect_n][0] = x; g_mrects[g_mrect_n][1] = y; g_mrects[g_mrect_n][2] = w; g_mrects[g_mrect_n][3] = h; g_mrect_n++; }
+}
 static struct { GLuint name; uint32_t w, h; int kind; int probed; } g_atlas[128]; static int g_natlas;
 static pthread_mutex_t g_atlas_lock = PTHREAD_MUTEX_INITIALIZER;
 static void atlas_track(GLuint name, uint32_t w, uint32_t h, int kind) {
@@ -736,7 +744,74 @@ static void atlas_track(GLuint name, uint32_t w, uint32_t h, int kind) {
 // white, and the fullscreen passes bury them before every flush read. Captured after each atlas-sampling draw and
 // alpha-merged over the delivered frame, they survive the bury.
 static uint8_t *g_text_buf[4]; static uint16_t g_text_reg[4][4]; static uint64_t g_text_seq[4]; static int g_text_n;
-static void text_layer_capture(EAGLContext *c) {
+static double g_text_ct[4];   // capture time per slot: the merge freshness gate (stale layers = fade-in-era garbage = the crash-loop poison)
+static int g_text_armed;   // set after a draw sampling a glyph atlas; the NEXT draw's pre-hook reads the region:
+                           // post-text, pre-bury - the deterministic capture point (the read-at-atlas-draw version raced
+                           // the backdrop composite and clean boots always lost it)
+static void text_layer_store(uint8_t *b, int32_t x, int32_t y, int32_t w, int32_t h) {
+    size_t nz = 0, nzrgb = 0;
+    for (size_t q = 0; q < (size_t)w * h; q++) {
+        const uint8_t *px = b + q * 4;
+        if (px[0] | px[1] | px[2] | px[3]) { nz++; if (px[0] | px[1] | px[2]) nzrgb++; }
+    }
+    if (nz < 200) { free(b); return; }        // empty layer (atlas draws fire before AND after the region fills)
+    if (nzrgb * 4 < nz) { free(b); return; }  // mask stage (alpha-only, rgb=0): merging it writes BLACK digit shapes
+    // NOTE: the >90%-opaque rejection is GONE. The phone-proven snap stats (138 attempts: 57 mask, 81 opaque, 0
+    // in-between) show this boot NEVER produces glyphs-over-transparency - the opaque snap IS the finished region
+    // (backdrop + tinted digits). Delivering it wholesale is the clock.
+    int slot = -1;
+    for (int i = 0; i < g_text_n; i++) if (g_text_reg[i][0] == (uint16_t)x && g_text_reg[i][1] == (uint16_t)y && g_text_reg[i][2] == (uint16_t)w && g_text_reg[i][3] == (uint16_t)h) { slot = i; break; }
+    if (slot < 0 && g_text_n < 4) slot = g_text_n++;
+    if (slot < 0) slot = 0;      // round-robin the last
+    free(g_text_buf[slot]);
+    g_text_buf[slot] = b; g_text_reg[slot][0] = x; g_text_reg[slot][1] = y; g_text_reg[slot][2] = w; g_text_reg[slot][3] = h; g_text_seq[slot]++;
+    g_text_ct[slot] = now_ms();
+    static unsigned nc; if (g_debug && nc++ < 200) EAGL_DEBUG("textlayer: captured %d,%d %dx%d nz %zu (slot %d)\n", x, y, w, h, nz, slot);
+}
+// Pre-draw: if an atlas draw just ran, the bound fbo NOW holds exactly the post-text/pre-bury state. Read EVERY
+// latched marker rect (the clock zone is not the only text zone - the line atlas draws its own region; reading
+// only the clock rect is why fresh sessions silently captured nothing).
+// BGL_TEXTSNAP gates the arm/snap pair: default OFF - the multi-rect reads are GPU syncs on the draw path and
+// slow the render server past SpringBoard's CA commit timeout (mach-port-guard crash = the respring loop).
+static int g_textsnap(void) { static int v = -1; if (v < 0) v = getenv("BGL_TEXTSNAP") != NULL; return v; }
+static void text_layer_snap(void) {
+    if (!g_text_armed || !g_textsnap()) return;
+    g_text_armed = 0;
+    if (!g_mrect_n) return;
+    static unsigned nsnap, nrej[3];
+    for (int rr = 0; rr < g_mrect_n; rr++) {
+    int32_t x = g_mrects[rr][0], y = g_mrects[rr][1], w = g_mrects[rr][2], h = g_mrects[rr][3];
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (w <= 0 || h <= 0 || (int)w * h < 10000) continue;   // the big text zones only (clock + line): the small tiles are noise and cost
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);                    // the bound target must actually contain the region:
+    if (vp[2] < x + w || vp[3] < y + h) continue;      // an atlas-sized cache target reads out of bounds = garbage (the pixel mess)
+    GLint rb = 0, pa = 4;
+    glGetIntegerv(GL_READ_BUFFER, &rb); glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
+    glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    uint8_t *b = malloc((size_t)w * h * 4);
+    GLenum rerr = GL_NO_ERROR;
+    if (b) { glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); rerr = glGetError(); }
+    glReadBuffer((GLenum)rb); glPixelStorei(GL_PACK_ALIGNMENT, pa);
+    if (!b || rerr != GL_NO_ERROR) { free(b); while (glGetError() != GL_NO_ERROR) {} continue; }   // failed read = undefined buffer
+    size_t nz = 0, nzrgb = 0;
+    for (size_t q = 0; q < (size_t)w * h; q++) {
+        const uint8_t *px = b + q * 4;
+        if (px[0] | px[1] | px[2] | px[3]) { nz++; if (px[0] | px[1] | px[2]) nzrgb++; }
+    }
+    nsnap++;
+    if (nz < 200) { free(b); nrej[0]++; }
+    else if (nzrgb * 4 < nz) { free(b); nrej[1]++; }
+    else text_layer_store(b, x, y, w, h);
+    if (g_debug && nsnap <= 400) EAGL_DEBUG("snap rect %d,%d %dx%d: nz %zu rgb %zu -> %s (rej empty %u mask %u)\n",
+                                            x, y, w, h, nz, nzrgb,
+                                            nz < 200 ? "EMPTY" : (nzrgb * 4 < nz ? "MASK" : "STORED"),
+                                            nrej[0], nrej[1]);
+    }
+}
+// Post-draw: did that draw sample a glyph atlas? Arm for the next pre-draw snap.
+static void text_layer_arm(EAGLContext *c) {
+    if (!g_textsnap()) return;
     GLint act0 = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act0);
     glActiveTexture(GL_TEXTURE0);
     GLint tex0 = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
@@ -745,42 +820,7 @@ static void text_layer_capture(EAGLContext *c) {
     int is_atlas = 0;
     for (int i = 0; i < g_natlas; i++) if (g_atlas[i].name == (GLuint)tex0) { is_atlas = 1; break; }
     pthread_mutex_unlock(&g_atlas_lock);
-    if (!is_atlas || !g_clock_valid) return;
-    int32_t x = g_clock_rect[0], y = g_clock_rect[1], w = g_clock_rect[2], h = g_clock_rect[3];
-    if (x < 0) x = 0; if (y < 0) y = 0;
-    if (w <= 0 || h <= 0) return;
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);                    // the bound target must actually contain the region:
-    if (vp[2] < x + w || vp[3] < y + h) return;        // an atlas-sized cache target reads out of bounds = garbage (the pixel mess)
-    GLint rb = 0, pa = 4;
-    glGetIntegerv(GL_READ_BUFFER, &rb); glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
-    glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    uint8_t *b = malloc((size_t)w * h * 4);
-    GLenum rerr = GL_NO_ERROR;
-    if (b) { glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, b); rerr = glGetError(); }
-    glReadBuffer((GLenum)rb); glPixelStorei(GL_PACK_ALIGNMENT, pa);
-    if (!b || rerr != GL_NO_ERROR) { free(b); while (glGetError() != GL_NO_ERROR) {} return; }   // failed read = undefined buffer
-    size_t nz = 0, nzrgb = 0;
-    for (size_t q = 0; q < (size_t)w * h; q++) {
-        const uint8_t *px = b + q * 4;
-        if (px[0] | px[1] | px[2] | px[3]) { nz++; if (px[0] | px[1] | px[2]) nzrgb++; }
-    }
-    if (nz < 200) { free(b); return; }        // never store an empty layer (the atlas draws fire before AND after the region fills)
-    if (nzrgb * 4 < nz) { free(b); return; }  // mask stage (alpha-only, rgb=0): merging it writes BLACK digit shapes - wait for the tinted stage
-    int slot = -1;
-    for (int i = 0; i < g_text_n; i++) if (g_text_reg[i][0] == (uint16_t)x && g_text_reg[i][1] == (uint16_t)y && g_text_reg[i][2] == (uint16_t)w && g_text_reg[i][3] == (uint16_t)h) { slot = i; break; }
-    if (slot < 0 && g_text_n < 4) slot = g_text_n++;
-    if (slot < 0) slot = 0;      // round-robin the last
-    static size_t g_text_nz[4]; static double g_text_time[4];
-    double nowT = now_ms();
-    if (g_text_buf[slot] && g_text_nz[slot] > 0 && nz * 2 < g_text_nz[slot] && nowT - g_text_time[slot] < 1000.0) {
-        free(b);                 // a much emptier read seconds after a full one: keep the good capture
-        return;
-    }
-    free(g_text_buf[slot]);
-    g_text_buf[slot] = b; g_text_reg[slot][0] = x; g_text_reg[slot][1] = y; g_text_reg[slot][2] = w; g_text_reg[slot][3] = h; g_text_seq[slot]++;
-    g_text_nz[slot] = nz; g_text_time[slot] = nowT;
-    static unsigned nc; if (g_debug && nc++ < 200) EAGL_DEBUG("textlayer: captured %d,%d %dx%d nz %zu (slot %d)\n", x, y, w, h, nz, slot);
+    if (is_atlas) g_text_armed = 1;
 }
 static int damage_watch(void) {          // /private/var/tmp/bgl-watch arms a 30 s uncapped logging window; a fresh touch re-arms
     static time_t t0 = (time_t)0 - 60;  // "long expired" so the boot's own touch arms the first window
@@ -886,14 +926,46 @@ static void sync_att(EAGLContext *c, int i) {
             // alive, phone-proven) into cache targets and get buried by the fullscreen passes before this flush
             // read. Alpha-merge every captured text layer over everything else - glyphs land, backdrop survives.
             // (Order matters: an earlier build merged BEFORE the rect flush and the blur snapshot erased the digits.)
+            // BGL_TEXTMERGE gates the WRITES: default OFF while the cache-orientation question is open - blind
+            // merges of opaque cache reads at wrong orientations poisoned SpringBoard's re-import and crash-looped
+            // it (the "50 shades of respring" night).
+            { static int tm = -1; if (tm < 0) tm = getenv("BGL_TEXTMERGE") != NULL;
             if (a->marker_ever) {
                 size_t merged = 0;
                 for (int t = 0; t < g_text_n; t++) if (g_text_buf[t]) {
-                    // count first (cap-limited log), then merge
-                    for (size_t q = 0; q < (size_t)g_text_reg[t][2] * g_text_reg[t][3]; q++) if (((const uint32_t *)g_text_buf[t])[q] >> 24 > 8) merged++;
-                    rgba_to_surface_rect_merge(g_text_buf[t], g_text_reg[t][2], g_text_reg[t][3], a->surf, g_text_reg[t][0], g_text_reg[t][1], flip, h);
+                    uint32_t lx = g_text_reg[t][0], ly = g_text_reg[t][1], lw = g_text_reg[t][2], lh = g_text_reg[t][3];
+                    if (lx + lw > w || ly + lh > h) continue;
+                    if (now_ms() - g_text_ct[t] > 1500.0) continue;   // FRESH LAYERS ONLY: at rest no atlas draws fire, so stored
+                                                                       // layers go stale (minutes old = fade-in-era). Orient proved it:
+                                                                       // same 0 / mirrored 0 = not mirror - ANCIENT. Stale writes were
+                                                                       // the SpringBoard crash-loop poison. Fresh = minute ticks + anims.
+                    // Self-orient (always computed, always logged): the layer was read from a CACHE fbo whose Y
+                    // axis may be mirrored relative to the present. Compare both row mappings against this
+                    // flush's own frame (sparse grid). Writes happen ONLY on a decisive 3:1 win - ambiguous
+                    // layers never touch the frame (the wrong-orientation writes crash-looped SpringBoard).
+                    size_t mSame = 0, mMirr = 0;
+                    for (uint32_t j = 0; j < lh; j += 7) {
+                        const uint32_t *lS = (const uint32_t *)(g_text_buf[t] + (size_t)j * lw * 4);
+                        const uint32_t *lM = (const uint32_t *)(g_text_buf[t] + (size_t)(lh - 1 - j) * lw * 4);
+                        const uint32_t *fA = (const uint32_t *)(buf + ((size_t)(ly + j) * w + lx) * 4);
+                        const uint32_t *fB = (const uint32_t *)(buf + ((size_t)(ly + lh - 1 - j) * w + lx) * 4);
+                        for (uint32_t k = 0; k < lw; k += 7) {
+                            if (lS[k] == fA[k]) mSame++;
+                            if (lM[k] == fB[k]) mMirr++;
+                        }
+                    }
+                    BOOL lmirr = mMirr > 3 * mSame + 1, lsame = mSame > 3 * mMirr + 1;
+                    static unsigned no; if (g_debug && no++ < 40) EAGL_DEBUG("orient slot %d rect %u,%u %ux%u: same %zu mirrored %zu -> %s\n", t, lx, ly, lw, lh, mSame, mMirr, lmirr ? "MIRRORED" : (lsame ? "same" : "AMBIGUOUS"));
+                    // The orient oracle was wrong-headed: the frame CHANGED after the capture (the bury), so a
+                    // pre-bury layer can never match the post-bury frame regardless of orientation (phone-proven:
+                    // perfect same==mirrored ties). Fresh layers deliver UNFLIPPED; the eyes decide the flip.
+                    if (!tm) continue;                      // data only: BGL_TEXTMERGE off
+                    (void)lmirr; (void)lsame;
+                    for (size_t q = 0; q < (size_t)lw * lh; q++) if (((const uint32_t *)g_text_buf[t])[q] >> 24 > 8) merged++;
+                    rgba_to_surface_rect_merge(g_text_buf[t], lw, lh, a->surf, lx, ly, flip, h);
                 }
                 { static unsigned nm; if (g_debug && merged && nm++ < 100) EAGL_DEBUG("textmerge surf %u: %d slots, %zu px\n", IOSurfaceGetID(a->surf), g_text_n, merged); }
+            }
             }
             free(buf);
         } else damage_rect_flush(a, NULL, 0, 0);
@@ -1213,6 +1285,7 @@ static void damage_marker_record(EAGLContext *c) {
         a->nrects++;
         memcpy(a->wrect, a->rect, sizeof a->wrect); a->wcount = a->nrects;   // refresh the latch for draw_watch_probe
         if ((int)w * h > (int)g_clock_rect[2] * g_clock_rect[3]) { g_clock_rect[0] = (uint16_t)x; g_clock_rect[1] = (uint16_t)y; g_clock_rect[2] = (uint16_t)w; g_clock_rect[3] = (uint16_t)h; g_clock_valid = 1; }
+        mrect_latch(x, y, w, h);
     }
     else a->rects_full = 1;
     // no a->dirty here: markers fire into BOTH flips every frame; dirtying them full-frame-synced the undrawn
@@ -1303,8 +1376,8 @@ static void draw_watch_probe(void) {
     }
 }
 
-static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); o_DrawArrays(a, b, c); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_capture(m); } draw_watch_probe(); if (g_probes()) { draw_probe("arrays", c); flip_delta_end("arrays", c); }}
-static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); o_DrawElements(a, b, c, d); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_capture(m); } draw_watch_probe(); if (g_probes()) { draw_probe("elements", b); flip_delta_end("elements", b); }}
+static void h_DrawArrays(GLenum a, GLint b, GLsizei c) { ctxless_warn("glDrawArrays"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); text_layer_snap(); o_DrawArrays(a, b, c); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_arm(m); } draw_watch_probe(); if (g_probes()) { draw_probe("arrays", c); flip_delta_end("arrays", c); }}
+static void h_DrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { ctxless_warn("glDrawElements"); g_draw_total++; if (cover_skip()) return; { EAGLContext *m = cur_ctx(); if (m && m->_private->cur_att >= 0 && g_damage_en()) damage_marker_record(m); } mark_cur_dirty(); if (g_probes()) flip_delta_begin(); feedback_fix_begin(); text_layer_snap(); o_DrawElements(a, b, c, d); feedback_fix_end(); { EAGLContext *m = cur_ctx(); if (m) text_layer_arm(m); } draw_watch_probe(); if (g_probes()) { draw_probe("elements", b); flip_delta_end("elements", b); }}
 static void (*o_DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 static void h_DrawArraysInstanced(GLenum a, GLint b, GLsizei c, GLsizei d) { ctxless_warn("glDrawArraysInstanced"); mark_cur_dirty(); o_DrawArraysInstanced(a, b, c, d); }
 static void (*o_DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
